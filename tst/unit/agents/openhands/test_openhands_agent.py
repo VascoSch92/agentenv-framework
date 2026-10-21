@@ -19,6 +19,7 @@ from starlette.testclient import TestClient
 from tst.unit.agents.openhands.agent import openhands_agent
 
 OpenHandsAgent = openhands_agent.OpenHandsAgent
+Endpoint = openhands_agent.Endpoint
 Outcome = openhands_agent.Outcome
 
 GRANT = {"kind": "http-put", "url": "https://objects.test/put", "expires_at": "2099-01-01T00:00:00Z"}
@@ -73,12 +74,7 @@ class FakeRuntime:
         return json.loads((conversations_dir / conversation_id / "base_state.json").read_text())
 
 
-@pytest.fixture(autouse=True)
-def endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm.test")
-    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
-    monkeypatch.setenv("LITELLM_EXTRA_HEADERS", '{"x-project": "p1"}')
-    monkeypatch.delenv(openhands_agent.DEFAULT_MODEL_ENV, raising=False)
+ENDPOINT = Endpoint("http://litellm.test", "sk-test", {"x-project": "p1"})
 
 
 @pytest.fixture
@@ -87,8 +83,12 @@ def runtime() -> FakeRuntime:
 
 
 @pytest.fixture
-def client(tmp_path: Path, runtime: FakeRuntime):
-    agent = OpenHandsAgent(runtime, home=tmp_path / "home", workspace=tmp_path / "ws")
+def agent(tmp_path: Path, runtime: FakeRuntime) -> OpenHandsAgent:
+    return OpenHandsAgent(runtime, endpoint=ENDPOINT, home=tmp_path / "home", workspace=tmp_path / "ws")
+
+
+@pytest.fixture
+def client(agent: OpenHandsAgent):
     with TestClient(agent.create_app(), client=("127.0.0.1", 50000)) as client:
         client.post("/ext/agent-config", json={"model": "claude-sonnet", "effort": "high"})
         yield client
@@ -127,7 +127,7 @@ def test_run_returns_the_reply_usage_and_live_trajectory(client: TestClient, run
     assert turn.text == 'fix the bug\n\n{\n  "k": 1\n}'
     assert turn.config.model == "claude-sonnet"
     assert turn.config.effort == "high"
-    assert (turn.base_url, turn.api_key, turn.extra_headers) == ("http://litellm.test", "sk-test", {"x-project": "p1"})
+    assert turn.endpoint == ENDPOINT
     trajectory = client.post("/ext/trajectory", json={"task_id": task["id"]}).json()["trajectory"]
     assert [event["kind"] for event in trajectory] == ["MessageEvent", "ActionEvent"]
 
@@ -228,8 +228,7 @@ def test_timeout_cancels_the_runtime(client: TestClient, runtime: FakeRuntime) -
     assert runtime.cancelled
 
 
-def test_missing_model_fails_without_running(tmp_path: Path, runtime: FakeRuntime) -> None:
-    agent = OpenHandsAgent(runtime, home=tmp_path / "home", workspace=tmp_path / "ws")
+def test_missing_model_fails_without_running(agent: OpenHandsAgent, runtime: FakeRuntime) -> None:
     with TestClient(agent.create_app()) as client:
         task = _send(client, [{"kind": "text", "text": "go"}])
 
@@ -237,9 +236,9 @@ def test_missing_model_fails_without_running(tmp_path: Path, runtime: FakeRuntim
     assert runtime.turns == []
 
 
-def test_registration_model_is_the_fallback(tmp_path: Path, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(openhands_agent.DEFAULT_MODEL_ENV, "fallback-model")
-    agent = OpenHandsAgent(runtime, home=tmp_path / "home", workspace=tmp_path / "ws")
+def test_the_default_model_is_the_fallback(tmp_path: Path, runtime: FakeRuntime) -> None:
+    agent = OpenHandsAgent(runtime, endpoint=ENDPOINT, default_model="fallback-model", home=tmp_path / "home",
+                           workspace=tmp_path / "ws")
     with TestClient(agent.create_app()) as client:
         task = _send(client, [{"kind": "text", "text": "go"}])
 
@@ -247,14 +246,30 @@ def test_registration_model_is_the_fallback(tmp_path: Path, runtime: FakeRuntime
     assert runtime.turns[0].config.model == "fallback-model"
 
 
-def test_missing_endpoint_is_an_infra_failure(client: TestClient, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("LITELLM_BASE_URL")
-
-    task = _send(client, [{"kind": "text", "text": "go"}])
+def test_missing_endpoint_is_an_infra_failure(tmp_path: Path, runtime: FakeRuntime) -> None:
+    agent = OpenHandsAgent(runtime, endpoint=None, default_model="m", home=tmp_path / "home", workspace=tmp_path / "ws")
+    with TestClient(agent.create_app()) as client:
+        task = _send(client, [{"kind": "text", "text": "go"}])
 
     _, data = _reply(task)
     assert (data["error_code"], data["error_type"]) == ("openhands.no_endpoint", "infra_error")
     assert runtime.turns == []
+
+
+def test_the_endpoint_is_read_from_the_litellm_variables() -> None:
+    environ = {"LITELLM_BASE_URL": "http://litellm.test", "LITELLM_API_KEY": "sk-test",
+               "LITELLM_EXTRA_HEADERS": '{"x-project": "p1"}'}
+    without_headers = {"LITELLM_BASE_URL": "http://litellm.test", "LITELLM_EXTRA_HEADERS": ""}
+
+    assert Endpoint.from_environ(environ) == ENDPOINT
+    assert Endpoint.from_environ(without_headers) == Endpoint("http://litellm.test")
+    assert Endpoint.from_environ({"LITELLM_API_KEY": "sk-test"}) is None
+
+
+@pytest.mark.parametrize("headers", ["{not json", '["x-project"]'])
+def test_malformed_extra_headers_are_refused_at_startup(headers: str) -> None:
+    with pytest.raises(ValueError, match="LITELLM_EXTRA_HEADERS"):
+        Endpoint.from_environ({"LITELLM_BASE_URL": "http://litellm.test", "LITELLM_EXTRA_HEADERS": headers})
 
 
 def _write() -> dict[str, Any]:
@@ -389,6 +404,16 @@ def test_a_snapshot_save_waits_for_its_context_running_task(
     assert not finished_while_running
     assert saved["response"].status_code == 200
     assert state["history"] == ["plant", "more"]
+
+
+def test_conversation_locks_are_dropped_once_released(
+    agent: OpenHandsAgent, client: TestClient, objects: dict[str, bytes]
+) -> None:
+    for context in ("one", "two", "three"):
+        _send(client, [{"kind": "text", "text": "go"}], context_id=context)
+    client.post("/ext/snapshot", json={"context_id": "one", "objects": {"trajectory": _write()}})
+
+    assert agent._conversation_locks == {}
 
 
 def test_a_bundle_skill_cannot_write_outside_its_directory(

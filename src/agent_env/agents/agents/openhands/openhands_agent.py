@@ -9,16 +9,16 @@ import asyncio
 import base64
 import json
 import mimetypes
-import os
 import shutil
 import tarfile
 import tempfile
 import threading
 import uuid
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol, Self
 from urllib.parse import urlsplit
 
 import httpx
@@ -95,6 +95,29 @@ class OpenHandsConfig(AgentConfig):
 
 
 @dataclass(frozen=True)
+class Endpoint:
+    """The LiteLLM gateway the model is called through, with the headers every call carries."""
+
+    base_url: str
+    api_key: str | None = None
+    extra_headers: Mapping[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_environ(cls, environ: Mapping[str, str]) -> Self | None:
+        """The endpoint the ``LITELLM_*`` variables name; None without a base URL, which fails each task instead."""
+        base_url = environ.get("LITELLM_BASE_URL")
+        if not base_url:
+            return None
+        try:
+            headers = json.loads(environ.get("LITELLM_EXTRA_HEADERS") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"LITELLM_EXTRA_HEADERS is not valid JSON: {exc}") from exc
+        if not isinstance(headers, dict):
+            raise ValueError("LITELLM_EXTRA_HEADERS must be a JSON object of header names to values")
+        return cls(base_url, environ.get("LITELLM_API_KEY"), headers)
+
+
+@dataclass(frozen=True)
 class Turn:
     """One task, as the runtime runs it."""
 
@@ -107,9 +130,7 @@ class Turn:
     skills_dir: Path
     skill_names: tuple[str, ...]
     config: OpenHandsConfig
-    base_url: str
-    api_key: str | None
-    extra_headers: Mapping[str, str]
+    endpoint: Endpoint
     on_event: Callable[[dict[str, Any]], None]
 
 
@@ -119,6 +140,12 @@ class Outcome:
     usage: Usage
     error_code: str | None = None
     error_type: Literal["agent_error", "infra_error"] = "agent_error"
+
+
+@dataclass
+class _ConversationLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    holders: int = 0
 
 
 class Runtime(Protocol):
@@ -247,27 +274,37 @@ def _install_conversation(archive: Path, conversations_dir: Path, target_id: str
     ),
 )
 class OpenHandsAgent(AgentEnvAgent):
-    def __init__(self, runtime: Runtime, *, home: Path | None = None, workspace: Path | None = None) -> None:
+    def __init__(
+        self,
+        runtime: Runtime,
+        *,
+        endpoint: Endpoint | None,
+        default_model: str | None = None,
+        home: Path | None = None,
+        workspace: Path | None = None,
+    ) -> None:
         self.runtime = runtime
+        self.endpoint = endpoint
+        self.default_model = default_model
         self.home = home or Path.home() / ".openhands-a2a"
         self.workspace = workspace or Path("/workspace")
         self.conversations_dir = self.home / "conversations"
         self.skills_dir = self.home / "skills"
         self.inputs_dir = self.home / "inputs"
-        # A conversation runs one task at a time; a snapshot of it waits for the task to end.
-        self._conversation_locks: dict[str, asyncio.Lock] = {}
+        # The framework already runs a context's tasks one at a time; this lets a snapshot save wait for the task
+        # running in its context. An entry lives only while it is held, so contexts never seen again leave nothing.
+        self._conversation_locks: dict[str, _ConversationLock] = {}
         # Restoring the workspace waits for no task to be running in it; tasks and saves wait for a restore to finish.
         self._workspace_lock = asyncio.Lock()
         self._running = 0
 
     async def run(self, request: TaskRequest[OpenHandsConfig]) -> TaskResult:
         config = request.config
-        if not config.model and (fallback := os.environ.get(DEFAULT_MODEL_ENV)):
-            config = config.model_copy(update={"model": fallback})
+        if not config.model and self.default_model:
+            config = config.model_copy(update={"model": self.default_model})
         if not config.model:
             return TaskResult.failure("openhands.no_model", "no model is configured; set 'model' through agent-config")
-        base_url = os.environ.get("LITELLM_BASE_URL")
-        if not base_url:
+        if self.endpoint is None:
             return TaskResult.failure("openhands.no_endpoint", "LITELLM_BASE_URL is not set", error_type="infra_error")
         workspace = request.workspace or self.workspace
         workspace.mkdir(parents=True, exist_ok=True)
@@ -295,15 +332,13 @@ class OpenHandsAgent(AgentEnvAgent):
             skills_dir=self.skills_dir,
             skill_names=tuple(str(skill["name"]) for skill in request.skills),
             config=config,
-            base_url=base_url,
-            api_key=os.environ.get("LITELLM_API_KEY"),
-            extra_headers=json.loads(os.environ.get("LITELLM_EXTRA_HEADERS") or "{}"),
+            endpoint=self.endpoint,
             on_event=on_event,
         )
         async with self._workspace_lock:
             self._running += 1
         try:
-            async with self._conversation_lock(conversation):
+            async with self._holding(conversation):
                 try:
                     async with asyncio.timeout(config.timeout_seconds):
                         outcome = await self.runtime.run(turn)
@@ -336,8 +371,17 @@ class OpenHandsAgent(AgentEnvAgent):
                 chunks.append(f"[Attached file ({media_type}) saved at {path}]")
         return "\n\n".join(chunks), tuple(images)
 
-    def _conversation_lock(self, conversation: str) -> asyncio.Lock:
-        return self._conversation_locks.setdefault(conversation, asyncio.Lock())
+    @asynccontextmanager
+    async def _holding(self, conversation: str) -> AsyncIterator[None]:
+        entry = self._conversation_locks.setdefault(conversation, _ConversationLock())
+        entry.holders += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.holders -= 1
+            if not entry.holders:
+                del self._conversation_locks[conversation]
 
     def _require_idle(self) -> None:
         if self._running:
@@ -351,7 +395,7 @@ class OpenHandsAgent(AgentEnvAgent):
             # The conversation and the workspace are copied together, so a restore cannot fall between them.
             conversation_archive = Path(scratch) / "conversation.tar.gz"
             workspace_archive = Path(scratch) / "workspace.tar.gz"
-            async with self._conversation_lock(conversation), self._workspace_lock:
+            async with self._holding(conversation), self._workspace_lock:
                 if not (directory / BASE_STATE).is_file():
                     raise HTTPException(status_code=404, detail=f"No conversation for context '{request.context_id}'")
                 await asyncio.to_thread(_pack, directory, conversation_archive)

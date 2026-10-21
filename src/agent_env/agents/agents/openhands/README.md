@@ -29,7 +29,9 @@ and its path added to the prompt, for the agent's tools.
 | `triggers/v1` | SDK default |
 
 `OPENHANDS_A2A_MODEL` sets the model when agent-config sets none, as for a peer that other agents
-message directly, and `OPENHANDS_A2A_WORKSPACE` the workspace (default `/workspace`).
+message directly, and `OPENHANDS_A2A_WORKSPACE` the workspace (default `/workspace`). `a2a_server.py` reads
+these and the `LITELLM_*` variables once, at startup: a `LITELLM_EXTRA_HEADERS` that is not a JSON object stops
+the agent there, while a missing `LITELLM_BASE_URL` fails each task as `openhands.no_endpoint`.
 
 Snapshot `load` answers 409 while a task is running. A snapshot `save` waits for its context's running
 task to end, and a conversation runs one task at a time.

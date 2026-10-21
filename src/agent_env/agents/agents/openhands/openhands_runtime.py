@@ -7,6 +7,7 @@ from typing import Any, Final, Literal
 
 from agentenv_protocol.a2a_agent import Usage
 from openhands.sdk import LLM, Agent, AgentContext, Conversation, ImageContent, Message, TextContent
+from openhands.sdk.conversation.base import BaseConversation
 from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.conversation.response_utils import get_agent_final_response
 from openhands.sdk.conversation.state import ConversationExecutionStatus
@@ -31,9 +32,9 @@ def _llm(turn: Turn) -> LLM:
     return LLM(
         usage_id="agent",
         model=f"{_PROVIDER}/{turn.config.model}",
-        base_url=turn.base_url,
-        api_key=turn.api_key,
-        extra_headers=dict(turn.extra_headers) or None,
+        base_url=turn.endpoint.base_url,
+        api_key=turn.endpoint.api_key,
+        extra_headers=dict(turn.endpoint.extra_headers) or None,
         **options,
     )
 
@@ -100,7 +101,7 @@ def _failure(
     return Outcome(f"OpenHands failed: {error.detail}", usage, f"openhands.{error.code}", error_type)
 
 
-async def _run_to_its_end(conversation: Any) -> None:
+async def _run_to_its_end(conversation: BaseConversation) -> None:
     """``arun()`` on an event loop of its own in a worker thread, interrupted when the caller is cancelled and awaited
     until it has stopped. The SDK does blocking work between its awaits (tools, persistence), which on the server's
     loop would stall every other task and the agent's own HTTP endpoints, the peer-agents MCP server among them."""
@@ -136,7 +137,7 @@ class SdkRuntime:
                 errors.append(event)
             turn.on_event(event.model_dump(mode="json"))
 
-        def open_conversation() -> Any:
+        def open_conversation() -> BaseConversation:
             return Conversation(
                 agent=_agent(turn),
                 workspace=str(turn.workspace),
