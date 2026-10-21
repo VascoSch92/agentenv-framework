@@ -1,11 +1,17 @@
 import asyncio
 import base64
+import io
 import json
+import tarfile
+import threading
+import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from agentenv_protocol.a2a_agent import Usage
 from starlette.testclient import TestClient
@@ -21,31 +27,45 @@ READ = {"kind": "http-get", "url": "https://objects.test/get", "expires_at": "20
 
 @dataclass
 class FakeRuntime:
-    """Persists each conversation as the SDK does, a directory named by its id holding ``base_state.json``, and
-    records the turns it ran."""
+    """Persists each conversation as the SDK does, a directory named by its id holding ``base_state.json``, which it
+    resumes only under the id and directory the state records, and records the turns it ran. With ``gate`` set, a run
+    waits for it to open."""
 
     turns: list[Any] = field(default_factory=list)
     outcome: Outcome | None = None
     hang: bool = False
     cancelled: bool = False
+    gate: threading.Event | None = None
+    active: Counter = field(default_factory=Counter)
 
     async def run(self, turn: Any) -> Outcome:
         self.turns.append(turn)
         directory = turn.conversations_dir / turn.conversation_id
-        directory.mkdir(parents=True, exist_ok=True)
         state_path = directory / "base_state.json"
-        state = json.loads(state_path.read_text()) if state_path.exists() else {"history": []}
-        state.update(id=str(uuid.UUID(turn.conversation_id)), persistence_dir=str(directory))
+        expected = {"id": str(uuid.UUID(turn.conversation_id)), "persistence_dir": str(directory)}
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            if {key: state[key] for key in expected} != expected:
+                raise ValueError(f"Conversation ID mismatch: provided {expected}, persisted {state}")
+        else:
+            directory.mkdir(parents=True)
+            state = {**expected, "history": []}
         state["history"].append(turn.text)
         state_path.write_text(json.dumps(state))
         turn.on_event({"kind": "MessageEvent", "source": "user"})
         turn.on_event({"kind": "ActionEvent", "tool_name": "terminal"})
-        if self.hang:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                self.cancelled = True
-                raise
+        self.active[turn.conversation_id] += 1
+        try:
+            while self.gate is not None and not self.gate.is_set():
+                await asyncio.sleep(0.01)
+            if self.hang:
+                # Bounded, so an agent that applies no timeout fails the test instead of hanging it.
+                await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        finally:
+            self.active[turn.conversation_id] -= 1
         return self.outcome or Outcome("Done.", Usage(tool_call_count=1, input_tokens=200, output_tokens=40,
                                                       total_tokens=240, cost_usd=0.5))
 
@@ -283,16 +303,17 @@ def test_snapshot_round_trip_rebinds_the_conversation_to_the_target_context(
 
     loaded = client.put("/ext/snapshot", json={"objects": {
         "trajectory": _read("trajectory"), "workspace": _read("workspace")}, "target_context_id": "target"})
-    _send(client, [{"kind": "text", "text": "what was the token?"}], context_id="target")
+    target = openhands_agent.conversation_id("target")
+    conversations = tmp_path / "home" / "conversations"
+    restored = runtime.history(conversations, target)
+    task = _send(client, [{"kind": "text", "text": "what was the token?"}], context_id="target")
 
     assert loaded.json() == {"context_id": "target"}
     assert (tmp_path / "ws" / "notes.txt").read_text() == "remember TOKEN-1"
     assert not (tmp_path / "ws" / "after.txt").exists()
-    target = openhands_agent.conversation_id("target")
-    conversations = tmp_path / "home" / "conversations"
-    state = runtime.history(conversations, target)
-    assert state["history"] == ["remember TOKEN-1", "what was the token?"]
-    assert (state["id"], state["persistence_dir"]) == (str(uuid.UUID(target)), str(conversations / target))
+    assert (restored["id"], restored["persistence_dir"]) == (str(uuid.UUID(target)), str(conversations / target))
+    assert task["status"]["state"] == "completed"
+    assert runtime.history(conversations, target)["history"] == ["remember TOKEN-1", "what was the token?"]
 
 
 def test_an_empty_workspace_restores_as_empty(
@@ -314,6 +335,107 @@ def test_snapshot_of_an_unknown_context_is_404(client: TestClient, objects: dict
     response = client.post("/ext/snapshot", json={"context_id": "nope", "objects": {"trajectory": _write()}})
 
     assert response.status_code == 404
+
+
+def _send_in_background(client: TestClient, text: str, context_id: str) -> threading.Thread:
+    thread = threading.Thread(target=_send, args=(client, [{"kind": "text", "text": text}], context_id))
+    thread.start()
+    return thread
+
+
+def _wait_until(condition, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.01)
+
+
+def test_a_snapshot_load_is_refused_while_a_task_runs(
+    client: TestClient, runtime: FakeRuntime, objects: dict[str, bytes]
+) -> None:
+    _send(client, [{"kind": "text", "text": "remember TOKEN-1"}], context_id="source")
+    client.post("/ext/snapshot", json={"context_id": "source", "objects": {"trajectory": _write()}})
+    runtime.gate = threading.Event()
+    running = _send_in_background(client, "keep working", "busy")
+    _wait_until(lambda: sum(runtime.active.values()) == 1)
+
+    busy = client.put("/ext/snapshot", json={"objects": {"trajectory": _read("trajectory")}, "target_context_id": "t"})
+    runtime.gate.set()
+    running.join()
+    idle = client.put("/ext/snapshot", json={"objects": {"trajectory": _read("trajectory")}, "target_context_id": "t"})
+
+    assert (busy.status_code, idle.status_code) == (409, 200)
+
+
+def test_a_snapshot_save_waits_for_its_context_running_task(
+    client: TestClient, runtime: FakeRuntime, objects: dict[str, bytes]
+) -> None:
+    _send(client, [{"kind": "text", "text": "plant"}], context_id="ctx-a")
+    runtime.gate = threading.Event()
+    running = _send_in_background(client, "more", "ctx-a")
+    _wait_until(lambda: sum(runtime.active.values()) == 1)
+    saved: dict[str, httpx.Response] = {}
+    saver = threading.Thread(target=lambda: saved.update(response=client.post(
+        "/ext/snapshot", json={"context_id": "ctx-a", "objects": {"trajectory": _write()}})))
+    saver.start()
+    time.sleep(0.3)
+    finished_while_running = "response" in saved
+    runtime.gate.set()
+    running.join()
+    saver.join()
+
+    with tarfile.open(fileobj=io.BytesIO(objects["trajectory"])) as tar:
+        state = json.load(tar.extractfile("base_state.json"))
+    assert not finished_while_running
+    assert saved["response"].status_code == 200
+    assert state["history"] == ["plant", "more"]
+
+
+def test_a_bundle_skill_cannot_write_outside_its_directory(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_download(source, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("payload")
+
+    monkeypatch.setattr(openhands_agent, "download", fake_download)
+    grant = {"media_type": "text/plain", "max_bytes": 64, "size_bytes": 8, "read": READ}
+    responses = [client.post("/ext/skill-config", json={
+        "name": "evil", "description": "Evil",
+        "skill_bundle": {"max_total_bytes": 128, "files": [
+            {"path": "SKILL.md", "object": grant}, {"path": path, "object": grant}]},
+    }) for path in ("../../escaped.sh", "/tmp/escaped.sh", "scripts/../../escaped.sh")]
+
+    assert [response.status_code for response in responses] == [400, 400, 400]
+    assert not (tmp_path / "home" / "escaped.sh").exists()
+    assert not (tmp_path / "home" / "skills").exists()
+
+
+def test_an_oversized_attachment_is_refused(
+    client: TestClient, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(openhands_agent, "MAX_ATTACHMENT_BYTES", 8)
+    monkeypatch.setattr(openhands_agent.httpx, "AsyncClient", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"x" * 64)), **kwargs))
+
+    task = _send(client, [{"kind": "text", "text": "read it"},
+                          {"kind": "file", "file": {"name": "big.txt", "uri": "https://files.test/big.txt"}}])
+
+    assert task["status"]["state"] == "failed"
+    assert _reply(task)[1]["error_code"] == "openhands.attachment"
+    assert runtime.turns == []
+
+
+def test_only_http_file_uris_are_fetched(client: TestClient, runtime: FakeRuntime) -> None:
+    task = _send(client, [{"kind": "text", "text": "read it"},
+                          {"kind": "file", "file": {"name": "passwd", "uri": "file:///etc/passwd"}}])
+
+    text, data = _reply(task)
+    assert task["status"]["state"] == "failed"
+    assert data["error_code"] == "openhands.attachment"
+    assert "unsupported file URI scheme" in text
+    assert runtime.turns == []
 
 
 def test_install_extension_is_declared_on_the_card(client: TestClient) -> None:

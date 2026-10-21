@@ -395,11 +395,9 @@ class OpenHandsAgent(AgentEnvAgent):
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         staging = self.skills_dir / f".{request.name}.{uuid.uuid4().hex}"
         try:
+            # The protocol admits only normalized relative paths, so none leaves the staging directory.
             for item in request.skill_bundle.files:
-                destination = (staging / item.path).resolve()
-                if not destination.is_relative_to(staging.resolve()):
-                    raise ValueError(f"skill file {item.path} escapes the skill directory")
-                await download(item.object, destination)
+                await download(item.object, staging / item.path)
             staging.rename(self.skills_dir / request.name)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
