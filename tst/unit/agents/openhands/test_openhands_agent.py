@@ -1,0 +1,332 @@
+import asyncio
+import base64
+import json
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+from agentenv_protocol.a2a_agent import Usage
+from starlette.testclient import TestClient
+
+from tst.unit.agents.openhands.agent import openhands_agent
+
+OpenHandsAgent = openhands_agent.OpenHandsAgent
+Outcome = openhands_agent.Outcome
+
+GRANT = {"kind": "http-put", "url": "https://objects.test/put", "expires_at": "2099-01-01T00:00:00Z"}
+READ = {"kind": "http-get", "url": "https://objects.test/get", "expires_at": "2099-01-01T00:00:00Z"}
+
+
+@dataclass
+class FakeRuntime:
+    """Persists each conversation as the SDK does, a directory named by its id holding ``base_state.json``, and
+    records the turns it ran."""
+
+    turns: list[Any] = field(default_factory=list)
+    outcome: Outcome | None = None
+    hang: bool = False
+    cancelled: bool = False
+
+    async def run(self, turn: Any) -> Outcome:
+        self.turns.append(turn)
+        directory = turn.conversations_dir / turn.conversation_id
+        directory.mkdir(parents=True, exist_ok=True)
+        state_path = directory / "base_state.json"
+        state = json.loads(state_path.read_text()) if state_path.exists() else {"history": []}
+        state.update(id=str(uuid.UUID(turn.conversation_id)), persistence_dir=str(directory))
+        state["history"].append(turn.text)
+        state_path.write_text(json.dumps(state))
+        turn.on_event({"kind": "MessageEvent", "source": "user"})
+        turn.on_event({"kind": "ActionEvent", "tool_name": "terminal"})
+        if self.hang:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        return self.outcome or Outcome("Done.", Usage(tool_call_count=1, input_tokens=200, output_tokens=40,
+                                                      total_tokens=240, cost_usd=0.5))
+
+    def history(self, conversations_dir: Path, conversation_id: str) -> dict[str, Any]:
+        return json.loads((conversations_dir / conversation_id / "base_state.json").read_text())
+
+
+@pytest.fixture(autouse=True)
+def endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm.test")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
+    monkeypatch.setenv("LITELLM_EXTRA_HEADERS", '{"x-project": "p1"}')
+    monkeypatch.delenv(openhands_agent.DEFAULT_MODEL_ENV, raising=False)
+
+
+@pytest.fixture
+def runtime() -> FakeRuntime:
+    return FakeRuntime()
+
+
+@pytest.fixture
+def client(tmp_path: Path, runtime: FakeRuntime):
+    agent = OpenHandsAgent(runtime, home=tmp_path / "home", workspace=tmp_path / "ws")
+    with TestClient(agent.create_app(), client=("127.0.0.1", 50000)) as client:
+        client.post("/ext/agent-config", json={"model": "claude-sonnet", "effort": "high"})
+        yield client
+
+
+def _send(client: TestClient, parts: list[dict[str, Any]], context_id: str = "ctx-1") -> dict[str, Any]:
+    response = client.post("/a2a", json={
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "message/send",
+        "params": {
+            "message": {"kind": "message", "messageId": uuid.uuid4().hex, "role": "user",
+                        "contextId": context_id, "parts": parts},
+            "configuration": {"blocking": True},
+        },
+    })
+    return response.json()["result"]
+
+
+def _reply(task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    parts = task["status"]["message"]["parts"]
+    text = "".join(part.get("text", "") for part in parts if part["kind"] == "text")
+    data = next((part["data"] for part in parts if part["kind"] == "data"), {})
+    return text, data
+
+
+def test_run_returns_the_reply_usage_and_live_trajectory(client: TestClient, runtime: FakeRuntime) -> None:
+    task = _send(client, [{"kind": "text", "text": "fix the bug"}, {"kind": "data", "data": {"k": 1}}])
+
+    text, data = _reply(task)
+    assert task["status"]["state"] == "completed"
+    assert text == "Done."
+    assert data["usage"] == {"tool_call_count": 1, "input_tokens": 200, "output_tokens": 40, "total_tokens": 240,
+                             "cost_usd": 0.5}
+    turn = runtime.turns[0]
+    assert turn.text == 'fix the bug\n\n{\n  "k": 1\n}'
+    assert turn.config.model == "claude-sonnet"
+    assert turn.config.effort == "high"
+    assert (turn.base_url, turn.api_key, turn.extra_headers) == ("http://litellm.test", "sk-test", {"x-project": "p1"})
+    trajectory = client.post("/ext/trajectory", json={"task_id": task["id"]}).json()["trajectory"]
+    assert [event["kind"] for event in trajectory] == ["MessageEvent", "ActionEvent"]
+
+
+def test_a_context_keeps_one_conversation(client: TestClient, runtime: FakeRuntime, tmp_path: Path) -> None:
+    _send(client, [{"kind": "text", "text": "one"}], context_id="ctx/a b")
+    _send(client, [{"kind": "text", "text": "two"}], context_id="ctx/a b")
+    _send(client, [{"kind": "text", "text": "three"}], context_id="ctx-2")
+
+    first, second, other = (turn.conversation_id for turn in runtime.turns)
+    assert first == second == openhands_agent.conversation_id("ctx/a b")
+    assert other != first
+    assert runtime.history(tmp_path / "home" / "conversations", first)["history"] == ["one", "two"]
+
+
+def test_mcp_servers_and_the_peer_tools_reach_the_runtime(client: TestClient, runtime: FakeRuntime) -> None:
+    client.post("/ext/mcp-config", json={"name": "files", "url": "http://mcp.test/mcp",
+                                         "headers": {"Authorization": "Bearer t"}})
+
+    _send(client, [{"kind": "text", "text": "go"}])
+
+    servers = runtime.turns[0].mcp_servers
+    assert servers["files"] == {"url": "http://mcp.test/mcp", "headers": {"Authorization": "Bearer t"}}
+    assert servers["peer_agents"]["url"].endswith("/ext/peer-agents/mcp")
+
+
+def test_the_configured_role_is_sent_to_every_mcp_server(client: TestClient, runtime: FakeRuntime) -> None:
+    client.post("/ext/mcp-config", json={"name": "files", "url": "http://mcp.test/mcp",
+                                         "headers": {"Authorization": "Bearer t", "AgentEnv-Role": "stale"}})
+    client.post("/ext/agent-config", json={"role": "buyer"})
+
+    _send(client, [{"kind": "text", "text": "go"}])
+
+    servers = runtime.turns[0].mcp_servers
+    assert servers["files"]["headers"] == {"Authorization": "Bearer t", "AgentEnv-Role": "buyer"}
+    assert servers["peer_agents"]["headers"] == {"AgentEnv-Role": "buyer"}
+
+
+def test_images_are_attached_and_every_file_is_left_on_disk(client: TestClient, runtime: FakeRuntime) -> None:
+    png = base64.b64encode(b"\x89PNG").decode()
+    mp3 = base64.b64encode(b"ID3").decode()
+    _send(client, [{"kind": "text", "text": "look"},
+                   {"kind": "file", "file": {"name": "../red.png", "mimeType": "image/png", "bytes": png}},
+                   {"kind": "file", "file": {"name": "clip.mp3", "mimeType": "audio/mpeg", "bytes": mp3}}])
+
+    turn = runtime.turns[0]
+    assert turn.images == (f"data:image/png;base64,{png}",)
+    saved = [line.split(" saved at ")[1].rstrip("]") for line in turn.text.split("\n\n")[1:]]
+    assert [Path(path).name for path in saved] == ["1-red.png", "2-clip.mp3"]
+    assert Path(saved[1]).read_bytes() == b"ID3"
+
+
+def test_inline_and_bundle_skills_are_installed_for_the_runtime(
+    client: TestClient, runtime: FakeRuntime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_download(source, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(f"from {source.read.url}")
+
+    monkeypatch.setattr(openhands_agent, "download", fake_download)
+    grant = {"media_type": "text/markdown", "max_bytes": 64, "size_bytes": 8, "read": READ}
+    client.post("/ext/skill-config", json={"name": "greet", "description": "Greet", "skill_md": "# Greet\nSay hi."})
+    client.post("/ext/skill-config", json={
+        "name": "lint", "description": "Lint",
+        "skill_bundle": {"max_total_bytes": 128, "files": [
+            {"path": "SKILL.md", "object": grant}, {"path": "scripts/run.sh", "object": grant}]},
+    })
+
+    _send(client, [{"kind": "text", "text": "go"}])
+
+    skills = tmp_path / "home" / "skills"
+    assert (skills / "greet" / "SKILL.md").read_text() == "# Greet\nSay hi."
+    assert (skills / "lint" / "scripts" / "run.sh").read_text() == f"from {READ['url']}"
+    assert sorted(path.name for path in skills.iterdir()) == ["greet", "lint"]
+    assert runtime.turns[0].skills_dir == skills
+    assert sorted(runtime.turns[0].skill_names) == ["greet", "lint"]
+
+
+def test_a_runtime_failure_keeps_its_code_and_type(client: TestClient, runtime: FakeRuntime) -> None:
+    runtime.outcome = Outcome("OpenHands failed: rate limited", Usage(), "openhands.RateLimitError", "infra_error")
+
+    task = _send(client, [{"kind": "text", "text": "go"}])
+
+    text, data = _reply(task)
+    assert task["status"]["state"] == "failed"
+    assert text == "OpenHands failed: rate limited"
+    assert (data["error_code"], data["error_type"]) == ("openhands.RateLimitError", "infra_error")
+
+
+def test_timeout_cancels_the_runtime(client: TestClient, runtime: FakeRuntime) -> None:
+    runtime.hang = True
+    client.post("/ext/agent-config", json={"timeout_seconds": 1})
+
+    task = _send(client, [{"kind": "text", "text": "go"}])
+
+    assert task["status"]["state"] == "failed"
+    assert _reply(task)[1]["error_code"] == "openhands.timeout"
+    assert runtime.cancelled
+
+
+def test_missing_model_fails_without_running(tmp_path: Path, runtime: FakeRuntime) -> None:
+    agent = OpenHandsAgent(runtime, home=tmp_path / "home", workspace=tmp_path / "ws")
+    with TestClient(agent.create_app()) as client:
+        task = _send(client, [{"kind": "text", "text": "go"}])
+
+    assert _reply(task)[1]["error_code"] == "openhands.no_model"
+    assert runtime.turns == []
+
+
+def test_registration_model_is_the_fallback(tmp_path: Path, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(openhands_agent.DEFAULT_MODEL_ENV, "fallback-model")
+    agent = OpenHandsAgent(runtime, home=tmp_path / "home", workspace=tmp_path / "ws")
+    with TestClient(agent.create_app()) as client:
+        task = _send(client, [{"kind": "text", "text": "go"}])
+
+    assert task["status"]["state"] == "completed"
+    assert runtime.turns[0].config.model == "fallback-model"
+
+
+def test_missing_endpoint_is_an_infra_failure(client: TestClient, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LITELLM_BASE_URL")
+
+    task = _send(client, [{"kind": "text", "text": "go"}])
+
+    _, data = _reply(task)
+    assert (data["error_code"], data["error_type"]) == ("openhands.no_endpoint", "infra_error")
+    assert runtime.turns == []
+
+
+def _write() -> dict[str, Any]:
+    return {"media_type": "application/octet-stream", "max_bytes": 1 << 20, "write": GRANT}
+
+
+def _read(name: str) -> dict[str, Any]:
+    return {"media_type": "application/octet-stream", "max_bytes": 1 << 20,
+            "read": {**READ, "url": f"https://objects.test/{name}"}}
+
+
+@pytest.fixture
+def objects(monkeypatch: pytest.MonkeyPatch) -> dict[str, bytes]:
+    """An in-memory object store behind the transfer helpers the agent calls."""
+    stored: dict[str, bytes] = {}
+    names = iter(["trajectory", "workspace"])
+
+    class FakeUploaded(dict):
+        def model_dump(self, mode: str = "json") -> dict:
+            return dict(self)
+
+    async def fake_upload(target, source: Path):
+        body = source.read_bytes()
+        stored[next(names)] = body
+        return FakeUploaded(size_bytes=len(body))
+
+    async def fake_download(source, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(stored[source.read.url.rsplit("/", 1)[-1]])
+
+    monkeypatch.setattr(openhands_agent, "upload", fake_upload)
+    monkeypatch.setattr(openhands_agent, "download", fake_download)
+    return stored
+
+
+def test_snapshot_round_trip_rebinds_the_conversation_to_the_target_context(
+    client: TestClient, runtime: FakeRuntime, tmp_path: Path, objects: dict[str, bytes]
+) -> None:
+    _send(client, [{"kind": "text", "text": "remember TOKEN-1"}], context_id="source")
+    (tmp_path / "ws" / "notes.txt").write_text("remember TOKEN-1")
+    saved = client.post("/ext/snapshot", json={"context_id": "source", "objects": {
+        "trajectory": _write(), "workspace": _write()}})
+    assert saved.status_code == 200, saved.text
+    (tmp_path / "ws" / "notes.txt").unlink()
+    (tmp_path / "ws" / "after.txt").write_text("written after the snapshot")
+
+    loaded = client.put("/ext/snapshot", json={"objects": {
+        "trajectory": _read("trajectory"), "workspace": _read("workspace")}, "target_context_id": "target"})
+    _send(client, [{"kind": "text", "text": "what was the token?"}], context_id="target")
+
+    assert loaded.json() == {"context_id": "target"}
+    assert (tmp_path / "ws" / "notes.txt").read_text() == "remember TOKEN-1"
+    assert not (tmp_path / "ws" / "after.txt").exists()
+    target = openhands_agent.conversation_id("target")
+    conversations = tmp_path / "home" / "conversations"
+    state = runtime.history(conversations, target)
+    assert state["history"] == ["remember TOKEN-1", "what was the token?"]
+    assert (state["id"], state["persistence_dir"]) == (str(uuid.UUID(target)), str(conversations / target))
+
+
+def test_snapshot_of_an_unknown_context_is_404(client: TestClient, objects: dict[str, bytes]) -> None:
+    response = client.post("/ext/snapshot", json={"context_id": "nope", "objects": {"trajectory": _write()}})
+
+    assert response.status_code == 404
+
+
+def test_install_extension_is_declared_on_the_card(client: TestClient) -> None:
+    card = client.get("/.well-known/agent.json").json()
+    install = next(e for e in card["capabilities"]["extensions"] if e["uri"] == "urn:agentenv:install/v1")["params"]
+
+    assert install["a2a_port"] == 8000
+    assert set(install["required_params"]) == {"container", "agent_ctx_tar", "a2a_port", "litellm_api_key",
+                                               "litellm_base_url", "litellm_extra_headers"}
+    formatted = [command.format(container="c", agent_ctx_tar="/t.tar", a2a_port="8000", litellm_api_key="'sk-secret'",
+                                litellm_base_url="u", litellm_extra_headers="'{}'")
+                 for command in install["install_commands"]]
+    assert formatted[-1].endswith("c sh /opt/openhands-a2a/start.sh")
+    assert all("sk-secret" not in command.splitlines()[0] for command in formatted)
+    assert "LITELLM_API_KEY='sk-secret'" in formatted[-2].splitlines()
+
+
+def test_the_card_advertises_the_extensions_agent_env_validates(client: TestClient) -> None:
+    card = client.get("/.well-known/agent.json").json()
+    uris = {extension["uri"] for extension in card["capabilities"]["extensions"]}
+
+    assert {f"urn:agentenv:{name}/v1" for name in (
+        "agent-config", "mcp-config", "skill-config", "trajectory", "snapshot", "peer-agents", "install", "triggers",
+    )} <= uris
+
+
+def test_the_card_version_is_the_pinned_sdk() -> None:
+    requirements = (openhands_agent.Path(openhands_agent.__file__).parent / "requirements.txt").read_text().splitlines()
+
+    assert f"openhands-sdk=={openhands_agent.OPENHANDS_VERSION}" in requirements
+    assert f"openhands-tools=={openhands_agent.OPENHANDS_VERSION}" in requirements
