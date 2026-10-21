@@ -182,6 +182,8 @@ def _unpack(archive: Path, directory: Path) -> None:
     inside it first, so one that fails to extract leaves the contents as they were."""
     staging = directory / f".openhands-a2a-restore-{uuid.uuid4().hex}"
     try:
+        # An empty workspace's archive has no members, and extracting it creates nothing.
+        staging.mkdir()
         with tarfile.open(archive) as tar:
             tar.extractall(staging, filter="data")
         for child in directory.iterdir():

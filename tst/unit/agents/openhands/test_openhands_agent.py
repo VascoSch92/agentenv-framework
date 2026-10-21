@@ -295,6 +295,21 @@ def test_snapshot_round_trip_rebinds_the_conversation_to_the_target_context(
     assert (state["id"], state["persistence_dir"]) == (str(uuid.UUID(target)), str(conversations / target))
 
 
+def test_an_empty_workspace_restores_as_empty(
+    client: TestClient, tmp_path: Path, objects: dict[str, bytes]
+) -> None:
+    _send(client, [{"kind": "text", "text": "remember TOKEN-1"}], context_id="source")
+    client.post("/ext/snapshot", json={"context_id": "source", "objects": {
+        "trajectory": _write(), "workspace": _write()}})
+    (tmp_path / "ws" / "after.txt").write_text("written after the snapshot")
+
+    loaded = client.put("/ext/snapshot", json={"objects": {
+        "trajectory": _read("trajectory"), "workspace": _read("workspace")}, "target_context_id": "target"})
+
+    assert loaded.status_code == 200, loaded.text
+    assert list((tmp_path / "ws").iterdir()) == []
+
+
 def test_snapshot_of_an_unknown_context_is_404(client: TestClient, objects: dict[str, bytes]) -> None:
     response = client.post("/ext/snapshot", json={"context_id": "nope", "objects": {"trajectory": _write()}})
 

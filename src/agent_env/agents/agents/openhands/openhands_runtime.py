@@ -91,8 +91,15 @@ async def _run_to_its_end(conversation: Any) -> None:
     """``arun()`` on an event loop of its own in a worker thread, interrupted when the caller is cancelled and awaited
     until it has stopped. The SDK does blocking work between its awaits (tools, persistence), which on the server's
     loop would stall every other task and the agent's own HTTP endpoints, the peer-agents MCP server among them."""
-    loop = asyncio.new_event_loop()
-    running = asyncio.ensure_future(asyncio.to_thread(loop.run_until_complete, conversation.arun()))
+    runner = asyncio.Runner()
+    loop = runner.get_loop()
+
+    def drive() -> None:
+        # Closing the runner cancels what the run left on its loop, LiteLLM's logging worker among them.
+        with runner:
+            runner.run(conversation.arun())
+
+    running = asyncio.ensure_future(asyncio.to_thread(drive))
     try:
         await asyncio.shield(running)
     except asyncio.CancelledError:
@@ -100,9 +107,6 @@ async def _run_to_its_end(conversation: Any) -> None:
             loop.call_soon_threadsafe(conversation.interrupt)
             await asyncio.wait([running])
         raise
-    finally:
-        if running.done():
-            loop.close()
 
 
 class SdkRuntime:
