@@ -3,7 +3,7 @@ default tools, the task's MCP servers and its skills."""
 
 import asyncio
 import uuid
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from agentenv_protocol.a2a_agent import Usage
 from openhands.sdk import LLM, Agent, AgentContext, Conversation, ImageContent, Message, TextContent
@@ -11,6 +11,7 @@ from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.conversation.response_utils import get_agent_final_response
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.event import ActionEvent, Event
+from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.event.error_classification import FailureKind
 from openhands.sdk.llm.utils.metrics import Metrics
 from openhands.sdk.mcp import MCPServer
@@ -85,6 +86,20 @@ def _usage(before: Metrics, after: Metrics, tool_calls: int) -> Usage:
     )
 
 
+def _failure(
+    error: ConversationErrorEvent | None,
+    fallback: str,
+    usage: Usage,
+    error_type: Literal["agent_error", "infra_error"],
+) -> Outcome:
+    """The run's last error event as a failure, typed by its classification when it has one, else ``error_type``."""
+    if error is None:
+        return Outcome(f"OpenHands failed: {fallback}", usage, "openhands.error", error_type)
+    if error.classification is not None:
+        error_type = "agent_error" if error.classification.kind == FailureKind.AGENT_ACTION else "infra_error"
+    return Outcome(f"OpenHands failed: {error.detail}", usage, f"openhands.{error.code}", error_type)
+
+
 async def _run_to_its_end(conversation: Any) -> None:
     """``arun()`` on an event loop of its own in a worker thread, interrupted when the caller is cancelled and awaited
     until it has stopped. The SDK does blocking work between its awaits (tools, persistence), which on the server's
@@ -110,11 +125,15 @@ async def _run_to_its_end(conversation: Any) -> None:
 class SdkRuntime:
     async def run(self, turn: Turn) -> Outcome:
         actions = 0
+        # The SDK reports why a run failed only as events, whether or not it raises.
+        errors: list[ConversationErrorEvent] = []
 
         def on_event(event: Event) -> None:
             nonlocal actions
             if isinstance(event, ActionEvent):
                 actions += 1
+            elif isinstance(event, ConversationErrorEvent):
+                errors.append(event)
             turn.on_event(event.model_dump(mode="json"))
 
         def open_conversation() -> Any:
@@ -138,14 +157,13 @@ class SdkRuntime:
                 await _run_to_its_end(conversation)
             except ConversationRunError as exc:
                 usage = _usage(before, conversation.conversation_stats.get_combined_metrics(), actions)
-                error = exc.conversation_error
-                if error is None:
-                    return Outcome(f"OpenHands failed: {exc.original_exception}", usage, "openhands.error", "infra_error")
-                kind = error.classification.kind if error.classification else None
-                error_type = "agent_error" if kind == FailureKind.AGENT_ACTION else "infra_error"
-                return Outcome(f"OpenHands failed: {error.detail}", usage, f"openhands.{error.code}", error_type)
+                error = exc.conversation_error or (errors[-1] if errors else None)
+                return _failure(error, str(exc.original_exception), usage, "infra_error")
             usage = _usage(before, conversation.conversation_stats.get_combined_metrics(), actions)
             status = conversation.state.execution_status
+            if status == ConversationExecutionStatus.ERROR:
+                # A run limit, such as the iteration cap, ends the run without raising: the agent's own failure.
+                return _failure(errors[-1] if errors else None, "the run ended in error", usage, "agent_error")
             if status != ConversationExecutionStatus.FINISHED:
                 return Outcome(f"OpenHands stopped with status '{status.value}'", usage, f"openhands.{status.value}")
             reply = get_agent_final_response(conversation.state.events)

@@ -35,8 +35,12 @@ Snapshot `load` answers 409 while a task is running. A snapshot `save` waits for
 task to end, and a conversation runs one task at a time.
 
 Usage is the conversation's spend over the task: tokens, cost as LiteLLM prices it, and tool calls. A
-failed run's error is an `agent_error` when the SDK classifies it as the agent's own, and an `infra_error`
-otherwise; a run that ends stuck or paused is an `agent_error`, and a timeout interrupts the conversation.
+failed run's error code is `openhands.<code>` of the SDK's last error event (`openhands.LLMAuthenticationError`,
+`openhands.MaxIterationsReached`, ...). It is typed by the SDK's classification when the event carries one;
+otherwise a run that raised is an `infra_error`, and one a run limit ended, or that ends stuck or paused, an
+`agent_error`. A timeout (`openhands.timeout`) interrupts the conversation, which the context's next task resumes.
+
+`tst/integration/cli/run_bundle_openhands_test.py` runs the built image against a fake OpenAI endpoint.
 
 ```bash
 docker build -t openhands-a2a src/agent_env/agents/agents/openhands
