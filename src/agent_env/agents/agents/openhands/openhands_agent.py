@@ -15,7 +15,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol, Self
@@ -50,26 +50,30 @@ from agentenv_protocol.a2a_agent import (
     extension,
     upload,
 )
+from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
-OPENHANDS_VERSION: Final = "1.57.0"
-TRAJECTORY_FORMAT: Final = "openhands-events/v1"
+OPENHANDS_VERSION: Final[str] = "1.57.0"
+TRAJECTORY_FORMAT: Final[str] = "openhands-events/v1"
 # The model when agent-config sets none, as for a peer that other agents message directly.
-DEFAULT_MODEL_ENV: Final = "OPENHANDS_A2A_MODEL"
-A2A_PORT: Final = 8000
-INSTALL_DIR: Final = "/opt/openhands-a2a"
-ENV_FILE: Final = "agent.env"
-BASE_STATE: Final = "base_state.json"
-FETCH_TIMEOUT_SECONDS: Final = 120
-MAX_ATTACHMENT_BYTES: Final = 256 * 1024 * 1024
+DEFAULT_MODEL_ENV: Final[str] = "OPENHANDS_A2A_MODEL"
+A2A_PORT: Final[int] = 8000
+INSTALL_DIR: Final[str] = "/opt/openhands-a2a"
+ENV_FILE: Final[str] = "agent.env"
+BASE_STATE: Final[str] = "base_state.json"
+FETCH_TIMEOUT_SECONDS: Final[int] = 120
+MAX_ATTACHMENT_BYTES: Final[int] = 256 * 1024 * 1024
 # A conversation id is derived from its context id, so a context finds its conversation across restarts.
-_CONVERSATIONS: Final = uuid.uuid5(uuid.NAMESPACE_URL, "urn:agentenv:agents:openhands")
+_CONVERSATIONS: Final[uuid.UUID] = uuid.uuid5(uuid.NAMESPACE_URL, "urn:agentenv:agents:openhands")
 # Images go to the model as images as well as to disk; any other file is left on disk for the agent's tools.
-_IMAGE_TYPES: Final = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_IMAGE_TYPES: Final[frozenset[str]] = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_NO_BODY_STATUSES: Final[frozenset[int]] = frozenset({204, 205, 304})
 
 # sudo only where it needs no password: VM sandboxes have it, a local sandbox runs docker as the user.
-_DOCKER: Final = "$(sudo -n true 2>/dev/null && echo sudo) docker"
-INSTALL_COMMANDS: Final = [
+_DOCKER: Final[str] = "$(sudo -n true 2>/dev/null && echo sudo) docker"
+INSTALL_COMMANDS: Final[list[str]] = [
     f"{_DOCKER} cp {{agent_ctx_tar}} {{container}}:/tmp/openhands-a2a-ctx.tar.gz",
     f"{_DOCKER} exec {{container}} sh -c 'mkdir -p {INSTALL_DIR} && tar -xf /tmp/openhands-a2a-ctx.tar.gz -C {INSTALL_DIR}"
     " && rm /tmp/openhands-a2a-ctx.tar.gz'",
@@ -94,7 +98,7 @@ class OpenHandsConfig(AgentConfig):
     timeout_seconds: int = 1800
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Endpoint:
     """The LiteLLM gateway the model is called through, with the headers every call carries."""
 
@@ -117,7 +121,7 @@ class Endpoint:
         return cls(base_url, environ.get("LITELLM_API_KEY"), headers)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Turn:
     """One task, as the runtime runs it."""
 
@@ -134,7 +138,7 @@ class Turn:
     on_event: Callable[[dict[str, Any]], None]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Outcome:
     text: str
     usage: Usage
@@ -142,7 +146,7 @@ class Outcome:
     error_type: Literal["agent_error", "infra_error"] = "agent_error"
 
 
-@dataclass
+@dataclass(slots=True)
 class _ConversationLock:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     holders: int = 0
@@ -152,6 +156,27 @@ class Runtime(Protocol):
     async def run(self, turn: Turn) -> Outcome:
         """Run ``turn`` to its end. Cancelled, it interrupts the conversation and re-raises once it has stopped."""
         ...
+
+    def stop(self) -> None:
+        """Interrupt every turn still running: the server is shutting down."""
+        ...
+
+
+async def _detail_body(_request: Request, exc: HTTPException) -> Response:
+    """An ``HTTPException`` as the ``{"detail": ...}`` body agent-env reads errors from."""
+    if exc.status_code < 200 or exc.status_code in _NO_BODY_STATUSES:
+        return Response(status_code=exc.status_code, headers=exc.headers)
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+@asynccontextmanager
+async def _turns_stop_with_the_server(app: Starlette) -> AsyncIterator[None]:
+    """The server's lifespan: as it shuts down, turns still running are interrupted, so their runs, in threads of
+    their own, do not keep the process alive after the server."""
+    try:
+        yield
+    finally:
+        app.state.agentenv_a2a.agent.runtime.stop()
 
 
 def conversation_id(context_id: str) -> str:
@@ -250,6 +275,7 @@ def _install_conversation(archive: Path, conversations_dir: Path, target_id: str
     ),
     config=OpenHandsConfig,
     config_description="Configure the OpenHands runtime: model, effort, system prompt and iteration limit.",
+    lifespan=_turns_stop_with_the_server,
     extensions=(
         MCP_CONFIG_V1,
         enable(TRAJECTORY_V1, live=True, description="The task's OpenHands SDK events, also while it runs."),
@@ -283,20 +309,25 @@ class OpenHandsAgent(AgentEnvAgent):
         home: Path | None = None,
         workspace: Path | None = None,
     ) -> None:
-        self.runtime = runtime
-        self.endpoint = endpoint
-        self.default_model = default_model
-        self.home = home or Path.home() / ".openhands-a2a"
-        self.workspace = workspace or Path("/workspace")
-        self.conversations_dir = self.home / "conversations"
-        self.skills_dir = self.home / "skills"
-        self.inputs_dir = self.home / "inputs"
+        self.runtime: Runtime = runtime
+        self.endpoint: Endpoint | None = endpoint
+        self.default_model: str | None = default_model
+        self.home: Path = home or Path.home() / ".openhands-a2a"
+        self.workspace: Path = workspace or Path("/workspace")
+        self.conversations_dir: Path = self.home / "conversations"
+        self.skills_dir: Path = self.home / "skills"
+        self.inputs_dir: Path = self.home / "inputs"
         # The framework already runs a context's tasks one at a time; this lets a snapshot save wait for the task
         # running in its context. An entry lives only while it is held, so contexts never seen again leave nothing.
         self._conversation_locks: dict[str, _ConversationLock] = {}
         # Restoring the workspace waits for no task to be running in it; tasks and saves wait for a restore to finish.
-        self._workspace_lock = asyncio.Lock()
-        self._running = 0
+        self._workspace_lock: asyncio.Lock = asyncio.Lock()
+        self._running: int = 0
+
+    def create_app(self) -> Starlette:
+        app = super().create_app()
+        app.add_exception_handler(HTTPException, _detail_body)
+        return app
 
     async def run(self, request: TaskRequest[OpenHandsConfig]) -> TaskResult:
         config = request.config
@@ -318,7 +349,8 @@ class OpenHandsAgent(AgentEnvAgent):
         appending = threading.Lock()
 
         def on_event(event: dict[str, Any]) -> None:
-            with appending:
+            # A cancelled task's log ends before its run has stopped, and refuses the interrupt's last events.
+            with appending, suppress(RuntimeError):
                 request.trajectory.append(event)
 
         conversation = conversation_id(request.context_id)
@@ -335,6 +367,8 @@ class OpenHandsAgent(AgentEnvAgent):
             endpoint=self.endpoint,
             on_event=on_event,
         )
+        # Bound before the run starts, so a live trajectory read or a mid-turn snapshot finds the conversation.
+        self.set_session_ref_for_context(request.context_id, conversation)
         async with self._workspace_lock:
             self._running += 1
         try:
@@ -344,7 +378,8 @@ class OpenHandsAgent(AgentEnvAgent):
                         outcome = await self.runtime.run(turn)
                 except TimeoutError:
                     message = f"OpenHands did not finish within {config.timeout_seconds}s"
-                    return TaskResult.builder().failed("openhands.timeout", message).add_text(message).build()
+                    return (TaskResult.builder().failed("openhands.timeout", message).add_text(message)
+                            .session_ref(conversation).build())
         finally:
             self._running -= 1
         builder = TaskResult.builder().session_ref(conversation).usage(outcome.usage)

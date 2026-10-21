@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+from typing import Final
 
 import httpx
 import pytest
@@ -23,13 +24,13 @@ from agent_env.task.teardown import teardown_run
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
-from tst.util.fake_openai import USAGE, Fault, FakeOpenAI, Text, ToolCall, answer, tool_then_answer
+from tst.util.fake_openai import USAGE, Fault, FakeOpenAI, Text, ToolCall, answer, tool_result_text, tool_then_answer
 
 pytestmark = [pytest.mark.integration, pytest.mark.int_test_slow]
 
-AGENT = "@local/agentenv-framework/agents/openhands"
-MODEL = "fake-model-1"
-ECHO_ENV = "@local/agentenv-framework/echo-mcp/echo"
+AGENT: Final[str] = "@local/agentenv-framework/agents/openhands"
+MODEL: Final[str] = "fake-model-1"
+ECHO_ENV: Final[str] = "@local/agentenv-framework/echo-mcp/echo"
 
 
 @pytest.fixture
@@ -212,3 +213,37 @@ def test_a_run_past_its_timeout_is_interrupted_and_its_context_keeps_working(sta
     # The interrupted turn stays in the conversation the next task resumes.
     last = json.dumps(endpoint.completions()[-1].body["messages"])
     assert "Say pong." in last and "Say pong again." in last, last
+
+
+def test_a_run_past_its_timeout_mid_command_leaves_no_process_behind(state, endpoint):
+    outcomes = {}
+
+    def respond(body):
+        result = tool_result_text(body)
+        if result is not None:
+            return Text(f"processes: {result}")
+        if "List the processes." in json.dumps(body["messages"][-1]):
+            return ToolCall("terminal", {"command": "ps -eo args", "security_risk": "LOW"})
+        return ToolCall("terminal", {"command": "sleep 120", "security_risk": "LOW"})
+
+    endpoint.respond = answer("pong")
+
+    async def steps(context):
+        await DeployAgentTaskStep(id="agent", version=None, sandbox_type="local", a2a_agent_id=AGENT).execute(context)
+        (agent,) = context.deployed_agents
+        base_url = agent.a2a_url or agent.api_url
+        endpoint.respond = respond
+        await protocol.post_agent_config(f"{base_url}/ext/agent-config", {"model": MODEL, "timeout_seconds": 5})
+        started = time.monotonic()
+        outcomes["timed_out"] = await _send(base_url, "ctx", "Sleep.")
+        outcomes["seconds"] = time.monotonic() - started
+        await protocol.post_agent_config(f"{base_url}/ext/agent-config", {"timeout_seconds": 120})
+        outcomes["after"] = await _send(base_url, "ctx", "List the processes.")
+
+    _with_agent(state, steps)
+
+    assert outcomes["timed_out"]["data"]["error_code"] == "openhands.timeout", outcomes
+    # The terminal tool notices its killed session only at its no-change timeout, 30 s.
+    assert outcomes["seconds"] < 60, outcomes
+    assert outcomes["after"]["state"] == "completed", outcomes
+    assert "ps -eo args" in outcomes["after"]["text"] and "sleep 120" not in outcomes["after"]["text"], outcomes

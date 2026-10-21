@@ -9,7 +9,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import httpx
 import pytest
@@ -22,11 +22,11 @@ OpenHandsAgent = openhands_agent.OpenHandsAgent
 Endpoint = openhands_agent.Endpoint
 Outcome = openhands_agent.Outcome
 
-GRANT = {"kind": "http-put", "url": "https://objects.test/put", "expires_at": "2099-01-01T00:00:00Z"}
-READ = {"kind": "http-get", "url": "https://objects.test/get", "expires_at": "2099-01-01T00:00:00Z"}
+GRANT: Final[dict[str, str]] = {"kind": "http-put", "url": "https://objects.test/put", "expires_at": "2099-01-01T00:00:00Z"}
+READ: Final[dict[str, str]] = {"kind": "http-get", "url": "https://objects.test/get", "expires_at": "2099-01-01T00:00:00Z"}
 
 
-@dataclass
+@dataclass(slots=True)
 class FakeRuntime:
     """Persists each conversation as the SDK does, a directory named by its id holding ``base_state.json``, which it
     resumes only under the id and directory the state records, and records the turns it ran. With ``gate`` set, a run
@@ -38,6 +38,10 @@ class FakeRuntime:
     cancelled: bool = False
     gate: threading.Event | None = None
     active: Counter = field(default_factory=Counter)
+    stopped: bool = False
+
+    def stop(self) -> None:
+        self.stopped = True
 
     async def run(self, turn: Any) -> Outcome:
         self.turns.append(turn)
@@ -74,7 +78,7 @@ class FakeRuntime:
         return json.loads((conversations_dir / conversation_id / "base_state.json").read_text())
 
 
-ENDPOINT = Endpoint("http://litellm.test", "sk-test", {"x-project": "p1"})
+ENDPOINT: Final[Endpoint] = Endpoint("http://litellm.test", "sk-test", {"x-project": "p1"})
 
 
 @pytest.fixture
@@ -226,6 +230,36 @@ def test_timeout_cancels_the_runtime(client: TestClient, runtime: FakeRuntime) -
     assert task["status"]["state"] == "failed"
     assert _reply(task)[1]["error_code"] == "openhands.timeout"
     assert runtime.cancelled
+
+
+def test_a_cancelled_task_interrupts_the_runtime(client: TestClient, runtime: FakeRuntime) -> None:
+    runtime.hang = True
+    sent = client.post("/a2a", json={"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": {
+        "message": {"kind": "message", "messageId": uuid.uuid4().hex, "role": "user", "contextId": "ctx",
+                    "parts": [{"kind": "text", "text": "go"}]},
+        "configuration": {"blocking": False}}}).json()["result"]
+    _wait_until(lambda: sum(runtime.active.values()) == 1)
+
+    client.post("/a2a", json={"jsonrpc": "2.0", "id": "2", "method": "tasks/cancel", "params": {"id": sent["id"]}})
+    _wait_until(lambda: runtime.cancelled)
+
+    task = client.post("/a2a", json={"jsonrpc": "2.0", "id": "3", "method": "tasks/get",
+                                     "params": {"id": sent["id"]}}).json()["result"]
+    assert task["status"]["state"] == "canceled"
+
+
+def test_the_server_shutting_down_stops_the_runtime(agent: OpenHandsAgent, runtime: FakeRuntime) -> None:
+    with TestClient(agent.create_app()):
+        assert not runtime.stopped
+
+    assert runtime.stopped
+
+
+def test_errors_are_answered_as_json_details(client: TestClient, objects: dict[str, bytes]) -> None:
+    response = client.post("/ext/snapshot", json={"context_id": "nope", "objects": {"trajectory": _write()}})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "No conversation for context 'nope'"}
 
 
 def test_missing_model_fails_without_running(agent: OpenHandsAgent, runtime: FakeRuntime) -> None:

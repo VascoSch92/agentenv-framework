@@ -3,7 +3,9 @@ default tools, the task's MCP servers and its skills."""
 
 import asyncio
 import uuid
-from typing import Any, Final, Literal
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import Any, Final, Literal, TypeAlias
 
 from agentenv_protocol.a2a_agent import Usage
 from openhands.sdk import LLM, Agent, AgentContext, Conversation, ImageContent, Message, TextContent
@@ -22,7 +24,7 @@ from openhands.tools.preset.default import get_default_tools
 from openhands_agent import Outcome, Turn
 
 # The AgentEnv endpoint is a LiteLLM gateway; this provider prefix sends LiteLLM's requests to it as is.
-_PROVIDER: Final = "litellm_proxy"
+_PROVIDER: Final[str] = "litellm_proxy"
 
 
 def _llm(turn: Turn) -> LLM:
@@ -101,29 +103,54 @@ def _failure(
     return Outcome(f"OpenHands failed: {error.detail}", usage, f"openhands.{error.code}", error_type)
 
 
-async def _run_to_its_end(conversation: BaseConversation) -> None:
-    """``arun()`` on an event loop of its own in a worker thread, interrupted when the caller is cancelled and awaited
-    until it has stopped. The SDK does blocking work between its awaits (tools, persistence), which on the server's
-    loop would stall every other task and the agent's own HTTP endpoints, the peer-agents MCP server among them."""
+# The conversations running a turn, by id, with the loop each runs on.
+_Running: TypeAlias = dict[int, tuple[asyncio.AbstractEventLoop, BaseConversation]]
+
+
+def _interrupt(loop: asyncio.AbstractEventLoop, conversation: BaseConversation) -> None:
+    """Interrupt the run and close its tool executors: the terminal tool does not heed the interrupt, and a command
+    it is running would otherwise hold the run's thread until the command ends."""
+    # A run that ends meanwhile closes its loop, and then has nothing left to interrupt.
+    with suppress(RuntimeError):
+        loop.call_soon_threadsafe(conversation.interrupt)
+    conversation.close()
+
+
+async def _run_to_its_end(conversation: BaseConversation, running: _Running) -> None:
+    """``arun()`` on an event loop of its own in a worker thread, listed in ``running`` while it runs, interrupted when
+    the caller is cancelled and awaited until it has stopped. The SDK does blocking work between its awaits (tools,
+    persistence), which on the server's loop would stall every other task and the agent's own HTTP endpoints, the
+    peer-agents MCP server among them."""
     runner = asyncio.Runner()
     loop = runner.get_loop()
 
     def drive() -> None:
         # Closing the runner cancels what the run left on its loop, LiteLLM's logging worker among them.
         with runner:
-            runner.run(conversation.arun())
+            running[id(conversation)] = (loop, conversation)
+            try:
+                runner.run(conversation.arun())
+            finally:
+                running.pop(id(conversation), None)
 
-    running = asyncio.ensure_future(asyncio.to_thread(drive))
+    thread = asyncio.ensure_future(asyncio.to_thread(drive))
     try:
-        await asyncio.shield(running)
+        await asyncio.shield(thread)
     except asyncio.CancelledError:
-        if not running.done():
-            loop.call_soon_threadsafe(conversation.interrupt)
-            await asyncio.wait([running])
+        if not thread.done():
+            await asyncio.to_thread(_interrupt, loop, conversation)
+            await asyncio.wait([thread])
         raise
 
 
+@dataclass(frozen=True, slots=True)
 class SdkRuntime:
+    _running: _Running = field(default_factory=dict, init=False, repr=False)
+
+    def stop(self) -> None:
+        for loop, conversation in list(self._running.values()):
+            _interrupt(loop, conversation)
+
     async def run(self, turn: Turn) -> Outcome:
         actions = 0
         # The SDK reports why a run failed only as events, whether or not it raises.
@@ -155,7 +182,7 @@ class SdkRuntime:
             content = [TextContent(text=turn.text), *(ImageContent(image_urls=[image]) for image in turn.images)]
             await asyncio.to_thread(conversation.send_message, Message(role="user", content=content))
             try:
-                await _run_to_its_end(conversation)
+                await _run_to_its_end(conversation, self._running)
             except ConversationRunError as exc:
                 usage = _usage(before, conversation.conversation_stats.get_combined_metrics(), actions)
                 error = exc.conversation_error or (errors[-1] if errors else None)

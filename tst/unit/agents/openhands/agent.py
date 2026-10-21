@@ -5,9 +5,10 @@ fake runtime instead."""
 import importlib
 import sys
 from pathlib import Path
+from typing import Final
 
 import agent_env
 
-AGENT_DIR = Path(agent_env.__file__).parent / "agents" / "agents" / "openhands"
+AGENT_DIR: Final[Path] = Path(agent_env.__file__).parent / "agents" / "agents" / "openhands"
 sys.path.insert(0, str(AGENT_DIR))
 openhands_agent = importlib.import_module("openhands_agent")

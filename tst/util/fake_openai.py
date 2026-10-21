@@ -10,20 +10,21 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Final
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Text:
     text: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ToolCall:
     name: str
     arguments: dict
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Fault:
     """``status``: answer with that HTTP error; ``stall``: send nothing for ``seconds``, then the answer."""
 
@@ -32,7 +33,7 @@ class Fault:
     seconds: float = 0.0
 
 
-@dataclass
+@dataclass(slots=True)
 class Seen:
     path: str
     headers: dict[str, str]
@@ -41,7 +42,7 @@ class Seen:
 
 Responder = Callable[[dict], Text | ToolCall]
 
-USAGE = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+USAGE: Final[dict[str, int]] = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
 
 
 def answer(text: str) -> Responder:
@@ -75,7 +76,7 @@ def tool_result_text(body: dict) -> str | None:
     return content or ""
 
 
-@dataclass
+@dataclass(slots=True)
 class FakeOpenAI:
     host: str = "127.0.0.1"
     respond: Responder = field(default_factory=lambda: answer("ok"))
