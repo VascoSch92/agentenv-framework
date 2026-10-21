@@ -1,11 +1,9 @@
 """The OpenHands SDK side of the agent: a task is one ``arun()`` of the context's persisted conversation, with the
 default tools, the task's MCP servers and its skills."""
 
-from __future__ import annotations
-
 import asyncio
 import uuid
-from typing import Any
+from typing import Any, Final
 
 from agentenv_protocol.a2a_agent import Usage
 from openhands.sdk import LLM, Agent, AgentContext, Conversation, ImageContent, Message, TextContent
@@ -22,7 +20,7 @@ from openhands.tools.preset.default import get_default_tools
 from openhands_agent import Outcome, Turn
 
 # The AgentEnv endpoint is a LiteLLM gateway; this provider prefix sends LiteLLM's requests to it as is.
-_PROVIDER = "litellm_proxy"
+_PROVIDER: Final = "litellm_proxy"
 
 
 def _llm(turn: Turn) -> LLM:

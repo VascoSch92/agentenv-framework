@@ -5,8 +5,6 @@ so later tasks in the context resume it. This module is the A2A side and imports
 the conversation.
 """
 
-from __future__ import annotations
-
 import asyncio
 import base64
 import json
@@ -20,7 +18,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 from urllib.parse import urlsplit
 
 import httpx
@@ -54,24 +52,24 @@ from agentenv_protocol.a2a_agent import (
 )
 from starlette.exceptions import HTTPException
 
-OPENHANDS_VERSION = "1.57.0"
-TRAJECTORY_FORMAT = "openhands-events/v1"
+OPENHANDS_VERSION: Final = "1.57.0"
+TRAJECTORY_FORMAT: Final = "openhands-events/v1"
 # The model when agent-config sets none, as for a peer that other agents message directly.
-DEFAULT_MODEL_ENV = "OPENHANDS_A2A_MODEL"
-A2A_PORT = 8000
-INSTALL_DIR = "/opt/openhands-a2a"
-ENV_FILE = "agent.env"
-BASE_STATE = "base_state.json"
-FETCH_TIMEOUT_SECONDS = 120
-MAX_ATTACHMENT_BYTES = 256 * 1024 * 1024
+DEFAULT_MODEL_ENV: Final = "OPENHANDS_A2A_MODEL"
+A2A_PORT: Final = 8000
+INSTALL_DIR: Final = "/opt/openhands-a2a"
+ENV_FILE: Final = "agent.env"
+BASE_STATE: Final = "base_state.json"
+FETCH_TIMEOUT_SECONDS: Final = 120
+MAX_ATTACHMENT_BYTES: Final = 256 * 1024 * 1024
 # A conversation id is derived from its context id, so a context finds its conversation across restarts.
-_CONVERSATIONS = uuid.uuid5(uuid.NAMESPACE_URL, "urn:agentenv:agents:openhands")
+_CONVERSATIONS: Final = uuid.uuid5(uuid.NAMESPACE_URL, "urn:agentenv:agents:openhands")
 # Images go to the model as images as well as to disk; any other file is left on disk for the agent's tools.
-_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_IMAGE_TYPES: Final = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
 # sudo only where it needs no password: VM sandboxes have it, a local sandbox runs docker as the user.
-_DOCKER = "$(sudo -n true 2>/dev/null && echo sudo) docker"
-INSTALL_COMMANDS = [
+_DOCKER: Final = "$(sudo -n true 2>/dev/null && echo sudo) docker"
+INSTALL_COMMANDS: Final = [
     f"{_DOCKER} cp {{agent_ctx_tar}} {{container}}:/tmp/openhands-a2a-ctx.tar.gz",
     f"{_DOCKER} exec {{container}} sh -c 'mkdir -p {INSTALL_DIR} && tar -xf /tmp/openhands-a2a-ctx.tar.gz -C {INSTALL_DIR}"
     " && rm /tmp/openhands-a2a-ctx.tar.gz'",
