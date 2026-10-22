@@ -186,6 +186,7 @@ def test_an_mcp_header_naming_a_variable_reaches_the_server_as_written(state, en
         await DeployAgentTaskStep(id="agent", version=None, sandbox_type="local", a2a_agent_id=AGENT).execute(context)
         (agent,) = context.deployed_agents
         base_url = agent.a2a_url or agent.api_url
+        await protocol.post_agent_config(f"{base_url}/ext/agent-config", {"model": MODEL})
         async with httpx.AsyncClient() as client:
             registered = await client.post(f"{base_url}/ext/mcp-config", json={
                 "name": "probe", "url": f"{endpoint.url}/mcp-probe", "headers": {"X-Probe": "${LITELLM_API_KEY}"}})
@@ -207,6 +208,7 @@ def test_a_conversation_the_sdk_cannot_resume_fails_the_next_task_as_an_infra_er
         await DeployAgentTaskStep(id="agent", version=None, sandbox_type="local", a2a_agent_id=AGENT).execute(context)
         (agent,) = context.deployed_agents
         base_url = agent.a2a_url or agent.api_url
+        await protocol.post_agent_config(f"{base_url}/ext/agent-config", {"model": MODEL})
         outcomes["first"] = await _send(base_url, "ctx", "Say pong.")
         subprocess.run(["docker", "exec", f"agent-{agent.sandbox_id}", "sh", "-c",
                         "for f in ~/.openhands-a2a/conversations/*/base_state.json; do printf '{' > \"$f\"; done"],

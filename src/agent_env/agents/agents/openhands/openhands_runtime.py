@@ -30,7 +30,8 @@ _PROVIDER: Final[str] = "litellm_proxy"
 
 class _GatewayLLM(LLM):
     """The SDK's LLM with the gateway's headers sent on every call but kept out of the conversation's persisted state,
-    which a snapshot uploads: the SDK saves the agent's LLM there and masks only its key fields."""
+    which a snapshot uploads: the SDK saves the agent's LLM there and masks only its key fields. The conversation's
+    stats don't count it, as they count only LLMs of exactly the SDK's class, so a turn's spend is read from its own."""
 
     _gateway_headers: dict[str, str] = PrivateAttr(default_factory=dict)
 
@@ -86,14 +87,18 @@ def _agent(turn: Turn) -> Agent:
     )
 
 
-def _usage(before: Metrics, after: Metrics, tool_calls: int) -> Usage:
+def _usage(agent: Agent, tool_calls: int) -> Usage:
+    """What the turn's LLMs have spent: they are made for the turn, so they start at nothing."""
+    llms = (agent.llm, getattr(agent.condenser, "llm", None))
+    metrics = Metrics()
+    for each in {id(llm.metrics): llm.metrics for llm in llms if llm is not None}.values():
+        metrics.merge(each)
+
     def spent(name: str) -> int:
-        return (getattr(after.accumulated_token_usage, name, 0) or 0) - (
-            getattr(before.accumulated_token_usage, name, 0) or 0
-        )
+        return getattr(metrics.accumulated_token_usage, name, 0) or 0
 
     input_tokens, output_tokens = spent("prompt_tokens"), spent("completion_tokens")
-    cost = after.accumulated_cost - before.accumulated_cost
+    cost = metrics.accumulated_cost
     return Usage(
         tool_call_count=tool_calls,
         input_tokens=input_tokens,
@@ -148,9 +153,11 @@ class SdkRuntime:
                 errors.append(event)
             turn.on_event(event.model_dump(mode="json"))
 
+        agent = _agent(turn)
+
         def open_conversation() -> BaseConversation:
             return Conversation(
-                agent=_agent(turn),
+                agent=agent,
                 workspace=str(turn.workspace),
                 persistence_dir=str(turn.conversations_dir),
                 conversation_id=uuid.UUID(turn.conversation_id),
@@ -168,7 +175,6 @@ class SdkRuntime:
         run = ConversationRun(conversation)
         self._runs.add(run)
         try:
-            before = conversation.conversation_stats.get_combined_metrics().model_copy(deep=True)
             content = [TextContent(text=turn.text), *(ImageContent(image_urls=[image]) for image in turn.images)]
             try:
                 await asyncio.to_thread(conversation.send_message, Message(role="user", content=content))
@@ -177,13 +183,13 @@ class SdkRuntime:
             try:
                 await run.to_its_end()
             except ConversationRunError as exc:
-                usage = _usage(before, conversation.conversation_stats.get_combined_metrics(), actions)
+                usage = _usage(agent, actions)
                 error = exc.conversation_error or (errors[-1] if errors else None)
                 return _failure(error, str(exc.original_exception), usage, "infra_error")
             except asyncio.CancelledError:
-                turn.on_usage(_usage(before, conversation.conversation_stats.get_combined_metrics(), actions))
+                turn.on_usage(_usage(agent, actions))
                 raise
-            usage = _usage(before, conversation.conversation_stats.get_combined_metrics(), actions)
+            usage = _usage(agent, actions)
             status = conversation.state.execution_status
             # Only the server's shutdown stops a run whose caller wasn't cancelled.
             if run.stopped.is_set() and status != ConversationExecutionStatus.FINISHED:
