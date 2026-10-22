@@ -332,6 +332,20 @@ def test_a_workspace_archive_that_fails_to_extract_changes_nothing(tmp_path: Pat
     assert [path.name for path in workspace.iterdir()] == ["keep.txt"]
 
 
+def test_an_empty_workspace_archive_restores_an_empty_workspace(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    archive = tmp_path / "workspace.tar.gz"
+    pi_agent._pack(empty, archive)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "later.txt").write_text("written after the snapshot")
+
+    pi_agent._unpack(archive, workspace)
+
+    assert list(workspace.iterdir()) == []
+
+
 def test_restoring_the_workspace_waits_for_no_running_task(
     tmp_path: Path, record: Path, objects: dict[str, bytes]
 ) -> None:
