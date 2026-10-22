@@ -106,7 +106,7 @@ and deserialized through a registry.
 | Package | Contents |
 |---|---|
 | `env/` | `Env` base class: a subclass declares `type`, implements `from_dict` and `async deploy(...) -> DeployedEnv`, and may override `reset` and `load_file_artifact_universe`. Built-ins in `env/envs/`: `MCPServerEnv` (`mcp_server`), `MultiEnv` (`multi`, MCP servers plus websites), `ServiceDBEnv` (`service_db`, PostgreSQL), `WebsiteEnv` (`website`), `GatewayEnv` (`gateway_server`). `env/gateway/gateway.py` is the env-side gateway server, container-only code. |
-| `artifact/` | Immutable versioned artifacts; every `put()` creates a new version. The document goes to the document store, binary payloads to the object store. Built-ins: `CliArtifact` (`cli`), `FileArtifact` (`file`), `FileArtifactUniverse` (`file_artifact_universe`), `DockerImageArtifact` (`docker_image`), `EnvironmentArtifact` (`environment`), `EnvironmentUniverseArtifact` (`environment_universe`), `SkillArtifact` (`skill`); `[artifacts] type_aliases` maps another stored spelling of a type onto one of them. A `DockerImageArtifact` holds a tar.gz of its image, or, written by `put_ref` (`--image-ref` on `env mcp-server put` and `a2a-agent put`), only a registry reference with its tag pinned to a digest, which sandboxes pull, or, written by `put_context`, only its build context, which a VM sandbox builds before running it (`VmSandbox.load_docker_images`) and Modal builds before creating its container (`ModalSandboxProvider.prepare_image`, outside a fallback chain's deadline); anything else that runs images by name (a container on the local provider, a lone server on any provider but Modal) refuses such an image. A build context (`utils/docker/context.py`) is what `docker build` would send, `.dockerignore` applied, written so equal files give equal bytes and an equal `source_digest`. |
+| `artifact/` | Immutable versioned artifacts; every `put()` creates a new version. The document goes to the document store, binary payloads to the object store. Built-ins: `CliArtifact` (`cli`), `FileArtifact` (`file`), `FileArtifactUniverse` (`file_artifact_universe`), `DockerImageArtifact` (`docker_image`), `EnvironmentArtifact` (`environment`), `EnvironmentUniverseArtifact` (`environment_universe`), `SkillArtifact` (`skill`); `[artifacts] type_aliases` maps another stored spelling of a type onto one of them. A `DockerImageArtifact` holds a tar.gz of its image, or, written by `put_ref` (`--image-ref` on `env mcp-server put` and `a2a-agent put`), only a registry reference with its tag pinned to a digest, which sandboxes pull, or a published image's tag with its `image_digest` and its build context, which sandboxes pull by the digest and build from the context when they can't (the infra images, and a bundle agent built from a shipped agent's sources, `Plan.published`), or, written by `put_context`, only its build context, which a VM sandbox builds before running it (`VmSandbox.load_docker_images`) and Modal builds before creating its container (`ModalSandboxProvider.prepare_image`, outside a fallback chain's deadline); anything else that runs images by name (a container on the local provider, a lone server on any provider but Modal) refuses such an image. A build context (`utils/docker/context.py`) is what `docker build` would send, `.dockerignore` applied, written so equal files give equal bytes and an equal `source_digest`. |
 | `task/`, `task_step/` | A `Task` holds its `TaskStep`s inline; `Task.run()` executes them as a DAG. `depends_on` (None means all prior steps) gates a step, independent steps run concurrently, `fail_task_on_error` makes a failure fatal or tolerated, `retry_config` rolls a failed span back through the step journal and re-dispatches it. Built-in steps live in `task_step/task_steps/` (`deploy_env`, `deploy_agent`, `prompt_agent`, the verifiers under `verifiers/`, and more). `task/episode/` runs a task with some of its agents played from outside, as a training loop does (`EpisodeSpec`). |
 | `store/` | Four store ABCs with local and cloud implementations: `DocumentStore` (SQLite, MongoDB, DynamoDB, Firestore with MongoDB compatibility), `ObjectStore` (filesystem, S3, Cloud Storage), `ImageStore` (local OCI registry, ECR), `SecretStore` (env vars or file, AWS Secrets Manager, Google Cloud Secret Manager). `VersionedEntityStore` implements the shared versioned get/put logic, `QueryBuilder` is the immutable chained query API, `store/base.py` holds the error types. `store/routing.py` is the `@local` namespace: while the CLI runs, an `@local/…` id and what an `@local` task's run records go to local stores beside the configured ones, and that run's writes to the configured stores are refused. A new backend must pass the conformance kits in `tst/store/`. |
 | `config/` | The `Config` singleton (`get_config`, `configure`, `reset_config`) in `config/runtime.py`, file discovery in `config/loader.py`, and `load_impl`, which resolves `module:Class` pointers. `agent_env.store` re-exports the config names for compatibility. |
@@ -270,18 +270,23 @@ installed sources as from the checkout.
 `.github/workflows/publish-pypi.yml` runs on the `v*` tag the release automation pushes: it waits
 for `main`'s CI to pass on the tagged commit, publishes `agentenv-framework-protocol` and then
 `agentenv-framework` to PyPI, pinning the protocol in `pyproject.toml` and in each shipped env's and agent's
-`requirements.txt` (`.github/scripts/shipped_bundles.py` lists them, so a new agent is pinned with no workflow change),
+`requirements.txt` (`.github/scripts/shipped_bundles.py pin` finds them, so a new agent is pinned with no workflow change,
+and every job that reads those folders runs it first, so an image's tag, its build and the wheel see the same sources),
 and creates the GitHub release, whose notes are the titles of the pull
 requests merged since the previous release.
 Once the repository variable `PUBLISH_INFRA_IMAGES` is `true`, it also publishes the infra images agent-env
-ships (`agent_env.env.published_images`) whose `src-<hex>` tags GHCR lacks: after `main`'s CI passes, each is
+ships and the Claude Code agent's (`agent_env.env.published_images`) whose `src-<hex>` tags GHCR lacks: after `main`'s CI passes, each is
 built on a runner of each platform, checked, and tagged as one multi-platform image, and a tag that exists is
-never moved. The wheel and the release notes record each image's digest, and a failed image job sends neither
-package to PyPI. Run by hand on `main`, the workflow publishes the images alone.
+never moved. The infra images are published before the protocol, and a failed infra image job sends neither package
+to PyPI. The agent's image installs the protocol the release pins, so each release builds it again once the protocol is
+on PyPI, and a failed agent image job keeps `agentenv-framework` off it. The wheel and the release notes record each
+image's digest. Run by hand on `main`, the workflow publishes the images alone.
 Its jobs that run agent-env (`.github/scripts/infra_images.py`) hold no token that writes; the jobs that push
 images or publish to PyPI install nothing and check what they're handed (`.github/scripts/infra_build.py`,
 standard library and the docker CLI only).
-Actions are pinned to commit SHAs; Dependabot updates them, the pinned uv, `uv.lock` and the UI's npm packages.
+Actions are pinned to commit SHAs; Dependabot updates them, the pinned uv, `uv.lock`, the UI's npm packages and
+the infra images' base images, each pinned by digest so that a bump rebuilds and republishes the image; Dependabot
+proposes only a base's digest and patch updates, and a major or minor upgrade is made by hand.
 
 ## Conventions
 
@@ -310,3 +315,6 @@ guide (configuration, environments, steps, artifacts, providers, the CLI) is
 www.agentenvframework.com/docs. A new feature, provider or option is documented there, not in the
 README: say in the pull request what the docs should cover, and a maintainer updates the site.
 `packages/agentenv-protocol/README.md` documents the protocol and the A2A agent framework.
+
+Guides for coding agents sit next to the code they cover: `src/agent_env/agents/AGENTS.md` for writing an A2A agent and
+`src/agent_env/providers/sandbox_providers/AGENTS.md` for writing a sandbox provider.
