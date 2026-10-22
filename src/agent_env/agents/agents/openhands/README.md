@@ -16,9 +16,9 @@ and event loop of its own.
 
 A context maps to one conversation, whose id is derived from the context id, persisted in
 `~/.openhands-a2a/conversations/<id>`, so follow-up tasks in the context resume it, across restarts too.
-Images are sent to the model as images; every file part is also saved under `~/.openhands-a2a/inputs`
-and its path added to the prompt, for the agent's tools, and listed as its conversation's in
-`~/.openhands-a2a/attachments`, so the conversation's snapshots carry it.
+Images are sent to the model as images; every file part is also saved in the conversation's own directory under
+`~/.openhands-a2a/inputs` and its path added to the prompt, for the agent's tools, and the conversation's snapshots
+carry it.
 
 | Extension | Implementation |
 |---|---|
@@ -26,7 +26,7 @@ and its path added to the prompt, for the agent's tools, and listed as its conve
 | `mcp-config/v1` | SDK default; each server becomes an HTTP `MCPServer` in the agent's `mcp_config`, with its headers, sent as written: a `${VAR}` in a URL or header is not filled from the agent's environment |
 | `skill-config/v1` | inline and bundle skills installed as `SKILL.md` directories under `~/.openhands-a2a/skills`, loaded into the agent's context |
 | `trajectory/v1` | live: the task's OpenHands SDK events, appended as the conversation emits them (format `openhands-events/v1`) |
-| `snapshot/v1` | `save` uploads the context's persisted conversation, with the files attached in the context, as a gzipped tar and, when asked, the workspace as another; `load` extracts both aside and checks the conversation before it replaces the workspace's contents, puts the attached files back at the paths the conversation names and installs the conversation under the target context's id, so an archive that fails to extract, or holds no conversation, changes nothing |
+| `snapshot/v1` | `save` uploads the context's persisted conversation, with the files attached in the context, as a gzipped tar and, when asked, the workspace as another; `load` extracts both aside, checks the conversation and points it at the target context's paths before it replaces anything, then replaces the workspace's contents, puts the attached files, as they were saved, in the target's own directory and installs the conversation under the target context's id, so an archive that fails to extract, or holds no conversation, changes nothing |
 | `peer-agents/v1` | SDK default: the `peer_agents` MCP server reaches the agent like any other |
 | `install/v1` | copies this directory into the task container as `/opt/openhands-a2a`, runs `install.sh` (Debian or Ubuntu, as root, with network access), writes the LiteLLM credentials to a 0600 `agent.env` through a heredoc and starts `start.sh`, which sources it |
 | `triggers/v1` | SDK default |

@@ -2,7 +2,6 @@ import asyncio
 import base64
 import io
 import json
-import shutil
 import tarfile
 import threading
 import time
@@ -57,7 +56,7 @@ class FakeRuntime:
                 raise ValueError(f"Conversation ID mismatch: provided {expected}, persisted {state}")
         else:
             directory.mkdir(parents=True)
-            state = {**expected, "history": []}
+            state = {**expected, "agent": {"kind": "Agent"}, "history": []}
         state["history"].append(turn.text)
         state_path.write_text(json.dumps(state))
         turn.on_event({"kind": "MessageEvent", "source": "user"})
@@ -418,42 +417,72 @@ def test_an_empty_workspace_restores_as_empty(
     assert list((tmp_path / "ws").iterdir()) == []
 
 
-def test_a_snapshot_carries_the_files_attached_in_its_context(
-    agent: OpenHandsAgent, client: TestClient, runtime: FakeRuntime, tmp_path: Path, objects: dict[str, bytes]
+def _attached(text: str) -> Path:
+    return Path(text.split(" saved at ")[1].rstrip("]"))
+
+
+def test_a_snapshot_restores_the_files_attached_in_its_context_as_they_were_saved(
+    client: TestClient, runtime: FakeRuntime, tmp_path: Path, objects: dict[str, bytes]
 ) -> None:
     notes = base64.b64encode(b"TOKEN-7").decode()
     _send(client, [{"kind": "text", "text": "keep this"},
                    {"kind": "file", "file": {"name": "notes.txt", "mimeType": "text/plain", "bytes": notes}}],
           context_id="source")
-    attached = Path(runtime.turns[0].text.split(" saved at ")[1].rstrip("]"))
+    attached = _attached(runtime.turns[0].text)
     saved = client.post("/ext/snapshot", json={"context_id": "source", "objects": {"trajectory": _write()}})
-    shutil.rmtree(tmp_path / "home")  # a fresh agent holds nothing of the source context
+    attached.write_bytes(b"changed after the snapshot")
 
     loaded = client.put("/ext/snapshot", json={"objects": {"trajectory": _read("trajectory")},
                                                "target_context_id": "target"})
 
-    name = attached.relative_to(tmp_path / "home" / "inputs").as_posix()
-    with tarfile.open(fileobj=io.BytesIO(objects["trajectory"])) as tar:
-        members = tar.getnames()
+    inputs, conversations = tmp_path / "home" / "inputs", tmp_path / "home" / "conversations"
+    source, target = (openhands_agent.conversation_id(context) for context in ("source", "target"))
+    (message,) = runtime.history(conversations, target)["history"]
     assert (saved.status_code, loaded.status_code) == (200, 200)
-    assert f"{openhands_agent.INPUTS}/{name}" in members
-    assert attached.read_bytes() == b"TOKEN-7"
-    # Listed as the target's own, so a snapshot of the target carries it on.
-    assert agent._attachments(openhands_agent.conversation_id("target")) == [name]
-    assert not (tmp_path / "home" / "conversations" / openhands_agent.conversation_id("target")
-                / openhands_agent.INPUTS).exists()
+    assert _attached(message) == inputs / target / attached.relative_to(inputs / source)
+    assert _attached(message).read_bytes() == b"TOKEN-7"
+    assert attached.read_bytes() == b"changed after the snapshot"
+    assert sorted(path.name for path in (conversations / target).iterdir()) == ["base_state.json"]
 
 
-def test_a_snapshot_that_holds_no_conversation_changes_nothing(
+def test_a_snapshot_loaded_on_an_agent_with_another_home_names_its_files_there(
     client: TestClient, runtime: FakeRuntime, tmp_path: Path, objects: dict[str, bytes]
+) -> None:
+    notes = base64.b64encode(b"TOKEN-8").decode()
+    _send(client, [{"kind": "text", "text": "keep this"},
+                   {"kind": "file", "file": {"name": "notes.txt", "mimeType": "text/plain", "bytes": notes}}],
+          context_id="source")
+    client.post("/ext/snapshot", json={"context_id": "source", "objects": {"trajectory": _write()}})
+    other = OpenHandsAgent(runtime, endpoint=ENDPOINT, home=tmp_path / "other", workspace=tmp_path / "other-ws")
+
+    with TestClient(other.create_app()) as other_client:
+        loaded = other_client.put("/ext/snapshot", json={"objects": {"trajectory": _read("trajectory")},
+                                                         "target_context_id": "target"})
+
+    target = openhands_agent.conversation_id("target")
+    (message,) = runtime.history(tmp_path / "other" / "conversations", target)["history"]
+    assert loaded.status_code == 200
+    assert _attached(message).is_relative_to(tmp_path / "other" / "inputs" / target)
+    assert _attached(message).read_bytes() == b"TOKEN-8"
+
+
+@pytest.mark.parametrize("member, content", [
+    ("README", b""),
+    ("base_state.json", b"{}"),
+    ("base_state.json", b'{"id": "not-a-uuid", "agent": {}}'),
+    ("base_state.json", json.dumps({"id": str(uuid.uuid4())}).encode()),
+], ids=["no-state", "empty-state", "bad-id", "no-agent"])
+def test_a_snapshot_that_holds_no_conversation_changes_nothing(
+    client: TestClient, runtime: FakeRuntime, tmp_path: Path, objects: dict[str, bytes], member: str, content: bytes
 ) -> None:
     _send(client, [{"kind": "text", "text": "remember TOKEN-1"}], context_id="source")
     client.post("/ext/snapshot", json={"context_id": "source", "objects": {"trajectory": _write(), "workspace": _write()}})
     (tmp_path / "ws" / "notes.txt").write_text("current")
     not_a_conversation = io.BytesIO()
     with tarfile.open(fileobj=not_a_conversation, mode="w:gz") as tar:
-        info = tarfile.TarInfo("README")
-        tar.addfile(info, io.BytesIO(b""))
+        info = tarfile.TarInfo(member)
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
     objects["trajectory"] = not_a_conversation.getvalue()
     conversations = tmp_path / "home" / "conversations"
     source = openhands_agent.conversation_id("source")
