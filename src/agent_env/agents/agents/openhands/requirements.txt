@@ -1,0 +1,3 @@
+agentenv-framework-protocol[agent]>=0.1.351
+openhands-sdk==1.57.0
+openhands-tools==1.57.0
