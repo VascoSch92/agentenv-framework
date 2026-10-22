@@ -5,6 +5,7 @@ no model key is needed. Needs a Docker daemon and network access for the image's
 import asyncio
 import json
 import logging
+import subprocess
 import time
 import uuid
 from typing import Final
@@ -160,6 +161,65 @@ def test_the_shipped_openhands_calls_the_tools_of_the_env_it_is_deployed_with(st
     assert result.exit_code == 0 and "tasks/echo.json v1: passed" in result.output, seen
     assert any(name.endswith("echo") for name in offered), seen
     assert ["ping-from-tool" in result for result in endpoint.tool_results()] == [True], seen
+
+
+def test_the_conversation_the_agent_keeps_condenses_and_holds_neither_the_key_nor_the_headers(state, endpoint):
+    # Spelled so the command, which the conversation records, holds neither value itself.
+    command = ("cd ~/.openhands-a2a/conversations && "
+               "(grep -rlF -e \"$(printf 'header-%s' check)\" -e \"$(printf 'fake-%s' key)\" . || echo no-secrets) && "
+               "grep -rl LLMSummarizingCondenser .")
+    endpoint.respond = tool_then_answer("terminal", {"command": command, "security_risk": "LOW"}, prefix="seen: ")
+
+    result = _run(_bundle(state / "kept", "ask", _ask("Look at your saved conversation.", "seen")))
+
+    (seen,) = endpoint.tool_results()
+    assert result.exit_code == 0 and "tasks/ask.json v1: passed" in result.output, (result.output, seen)
+    assert "no-secrets" in seen and "base_state.json" in seen, seen
+    # Sent all the same.
+    assert {call.headers.get("x-agentenv-test") for call in endpoint.completions()} == {"header-check"}
+
+
+def test_an_mcp_header_naming_a_variable_reaches_the_server_as_written(state, endpoint):
+    endpoint.respond = answer("pong")
+
+    async def steps(context):
+        await DeployAgentTaskStep(id="agent", version=None, sandbox_type="local", a2a_agent_id=AGENT).execute(context)
+        (agent,) = context.deployed_agents
+        base_url = agent.a2a_url or agent.api_url
+        async with httpx.AsyncClient() as client:
+            registered = await client.post(f"{base_url}/ext/mcp-config", json={
+                "name": "probe", "url": f"{endpoint.url}/mcp-probe", "headers": {"X-Probe": "${LITELLM_API_KEY}"}})
+            registered.raise_for_status()
+        await _send(base_url, "ctx", "Say pong.")
+
+    _with_agent(state, steps)
+
+    probes = [seen for seen in endpoint.seen if seen.path.startswith("/mcp-probe")]
+    assert probes, "the agent never called the MCP server"
+    assert {seen.headers.get("x-probe") for seen in probes} == {"${LITELLM_API_KEY}"}
+
+
+def test_a_conversation_the_sdk_cannot_resume_fails_the_next_task_as_an_infra_error(state, endpoint):
+    outcomes = {}
+    endpoint.respond = answer("pong")
+
+    async def steps(context):
+        await DeployAgentTaskStep(id="agent", version=None, sandbox_type="local", a2a_agent_id=AGENT).execute(context)
+        (agent,) = context.deployed_agents
+        base_url = agent.a2a_url or agent.api_url
+        outcomes["first"] = await _send(base_url, "ctx", "Say pong.")
+        subprocess.run(["docker", "exec", f"agent-{agent.sandbox_id}", "sh", "-c",
+                        "for f in ~/.openhands-a2a/conversations/*/base_state.json; do printf '{' > \"$f\"; done"],
+                       check=True)
+        outcomes["second"] = await _send(base_url, "ctx", "Say pong again.")
+
+    _with_agent(state, steps)
+
+    assert outcomes["first"]["state"] == "completed", outcomes
+    second = outcomes["second"]
+    assert second["state"] == "failed", outcomes
+    assert (second["data"]["error_code"], second["data"]["error_type"]) == ("openhands.start", "infra_error"), outcomes
+    assert second["text"].startswith("OpenHands could not start the turn: "), outcomes
 
 
 def test_a_model_endpoint_that_refuses_the_key_fails_the_task_as_an_infra_error(state, endpoint):

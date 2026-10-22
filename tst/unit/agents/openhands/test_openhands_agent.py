@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import shutil
 import tarfile
 import threading
 import time
@@ -22,6 +23,8 @@ OpenHandsAgent = openhands_agent.OpenHandsAgent
 Endpoint = openhands_agent.Endpoint
 Outcome = openhands_agent.Outcome
 
+# What a run cancelled midway had spent by then.
+SPENT: Final[Usage] = Usage(tool_call_count=1, input_tokens=90, output_tokens=10, total_tokens=100, cost_usd=0.1)
 GRANT: Final[dict[str, str]] = {"kind": "http-put", "url": "https://objects.test/put", "expires_at": "2099-01-01T00:00:00Z"}
 READ: Final[dict[str, str]] = {"kind": "http-get", "url": "https://objects.test/get", "expires_at": "2099-01-01T00:00:00Z"}
 
@@ -68,6 +71,7 @@ class FakeRuntime:
                 await asyncio.sleep(10)
         except asyncio.CancelledError:
             self.cancelled = True
+            turn.on_usage(SPENT)
             raise
         finally:
             self.active[turn.conversation_id] -= 1
@@ -232,6 +236,40 @@ def test_timeout_cancels_the_runtime(client: TestClient, runtime: FakeRuntime) -
     assert runtime.cancelled
 
 
+def test_a_timed_out_task_reports_what_its_run_had_spent(client: TestClient, runtime: FakeRuntime) -> None:
+    runtime.hang = True
+    client.post("/ext/agent-config", json={"timeout_seconds": 1})
+
+    task = _send(client, [{"kind": "text", "text": "go"}])
+
+    _, data = _reply(task)
+    assert data["error_code"] == "openhands.timeout"
+    assert data["usage"] == {"tool_call_count": 1, "input_tokens": 90, "output_tokens": 10, "total_tokens": 100,
+                             "cost_usd": 0.1}
+
+
+def test_reading_a_file_part_counts_toward_the_task_timeout(
+    client: TestClient, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_client = httpx.AsyncClient
+
+    async def stall(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(30)
+        return httpx.Response(200, content=b"late")
+
+    monkeypatch.setattr(openhands_agent.httpx, "AsyncClient", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(stall), **kwargs))
+    client.post("/ext/agent-config", json={"timeout_seconds": 1})
+    started = time.monotonic()
+
+    task = _send(client, [{"kind": "text", "text": "read it"},
+                          {"kind": "file", "file": {"name": "slow.txt", "uri": "https://files.test/slow.txt"}}])
+
+    assert _reply(task)[1]["error_code"] == "openhands.timeout"
+    assert time.monotonic() - started < 10
+    assert runtime.turns == []
+
+
 def test_a_cancelled_task_interrupts_the_runtime(client: TestClient, runtime: FakeRuntime) -> None:
     runtime.hang = True
     sent = client.post("/a2a", json={"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": {
@@ -380,6 +418,57 @@ def test_an_empty_workspace_restores_as_empty(
     assert list((tmp_path / "ws").iterdir()) == []
 
 
+def test_a_snapshot_carries_the_files_attached_in_its_context(
+    agent: OpenHandsAgent, client: TestClient, runtime: FakeRuntime, tmp_path: Path, objects: dict[str, bytes]
+) -> None:
+    notes = base64.b64encode(b"TOKEN-7").decode()
+    _send(client, [{"kind": "text", "text": "keep this"},
+                   {"kind": "file", "file": {"name": "notes.txt", "mimeType": "text/plain", "bytes": notes}}],
+          context_id="source")
+    attached = Path(runtime.turns[0].text.split(" saved at ")[1].rstrip("]"))
+    saved = client.post("/ext/snapshot", json={"context_id": "source", "objects": {"trajectory": _write()}})
+    shutil.rmtree(tmp_path / "home")  # a fresh agent holds nothing of the source context
+
+    loaded = client.put("/ext/snapshot", json={"objects": {"trajectory": _read("trajectory")},
+                                               "target_context_id": "target"})
+
+    name = attached.relative_to(tmp_path / "home" / "inputs").as_posix()
+    with tarfile.open(fileobj=io.BytesIO(objects["trajectory"])) as tar:
+        members = tar.getnames()
+    assert (saved.status_code, loaded.status_code) == (200, 200)
+    assert f"{openhands_agent.INPUTS}/{name}" in members
+    assert attached.read_bytes() == b"TOKEN-7"
+    # Listed as the target's own, so a snapshot of the target carries it on.
+    assert agent._attachments(openhands_agent.conversation_id("target")) == [name]
+    assert not (tmp_path / "home" / "conversations" / openhands_agent.conversation_id("target")
+                / openhands_agent.INPUTS).exists()
+
+
+def test_a_snapshot_that_holds_no_conversation_changes_nothing(
+    client: TestClient, runtime: FakeRuntime, tmp_path: Path, objects: dict[str, bytes]
+) -> None:
+    _send(client, [{"kind": "text", "text": "remember TOKEN-1"}], context_id="source")
+    client.post("/ext/snapshot", json={"context_id": "source", "objects": {"trajectory": _write(), "workspace": _write()}})
+    (tmp_path / "ws" / "notes.txt").write_text("current")
+    not_a_conversation = io.BytesIO()
+    with tarfile.open(fileobj=not_a_conversation, mode="w:gz") as tar:
+        info = tarfile.TarInfo("README")
+        tar.addfile(info, io.BytesIO(b""))
+    objects["trajectory"] = not_a_conversation.getvalue()
+    conversations = tmp_path / "home" / "conversations"
+    source = openhands_agent.conversation_id("source")
+
+    loaded = client.put("/ext/snapshot", json={"objects": {
+        "trajectory": _read("trajectory"), "workspace": _read("workspace")}, "target_context_id": "source"})
+
+    assert loaded.status_code == 400
+    assert "holds no OpenHands conversation" in loaded.json()["detail"]
+    assert [path.name for path in (tmp_path / "ws").iterdir()] == ["notes.txt"]
+    assert (tmp_path / "ws" / "notes.txt").read_text() == "current"
+    assert [path.name for path in conversations.iterdir()] == [source]
+    assert runtime.history(conversations, source)["history"] == ["remember TOKEN-1"]
+
+
 def test_snapshot_of_an_unknown_context_is_404(client: TestClient, objects: dict[str, bytes]) -> None:
     response = client.post("/ext/snapshot", json={"context_id": "nope", "objects": {"trajectory": _write()}})
 
@@ -440,6 +529,27 @@ def test_a_snapshot_save_waits_for_its_context_running_task(
     assert state["history"] == ["plant", "more"]
 
 
+def test_a_workspace_snapshot_waits_for_the_tasks_running_in_other_contexts(
+    client: TestClient, runtime: FakeRuntime, objects: dict[str, bytes]
+) -> None:
+    _send(client, [{"kind": "text", "text": "plant"}], context_id="ctx-a")
+    runtime.gate = threading.Event()
+    running = _send_in_background(client, "write files", "ctx-b")
+    _wait_until(lambda: sum(runtime.active.values()) == 1)
+    saved: dict[str, httpx.Response] = {}
+    saver = threading.Thread(target=lambda: saved.update(response=client.post(
+        "/ext/snapshot", json={"context_id": "ctx-a", "objects": {"trajectory": _write(), "workspace": _write()}})))
+    saver.start()
+    time.sleep(0.3)
+    finished_while_running = "response" in saved
+    runtime.gate.set()
+    running.join()
+    saver.join()
+
+    assert not finished_while_running
+    assert saved["response"].status_code == 200
+
+
 def test_conversation_locks_are_dropped_once_released(
     agent: OpenHandsAgent, client: TestClient, objects: dict[str, bytes]
 ) -> None:
@@ -494,6 +604,14 @@ def test_only_http_file_uris_are_fetched(client: TestClient, runtime: FakeRuntim
     assert task["status"]["state"] == "failed"
     assert data["error_code"] == "openhands.attachment"
     assert "unsupported file URI scheme" in text
+    assert runtime.turns == []
+
+
+def test_a_malformed_file_uri_fails_as_an_attachment(client: TestClient, runtime: FakeRuntime) -> None:
+    task = _send(client, [{"kind": "text", "text": "read it"},
+                          {"kind": "file", "file": {"name": "x.txt", "uri": "https://[::1/x.txt"}}])
+
+    assert _reply(task)[1]["error_code"] == "openhands.attachment"
     assert runtime.turns == []
 
 

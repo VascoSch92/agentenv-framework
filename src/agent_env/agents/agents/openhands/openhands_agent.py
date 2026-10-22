@@ -63,6 +63,8 @@ A2A_PORT: Final[int] = 8000
 INSTALL_DIR: Final[str] = "/opt/openhands-a2a"
 ENV_FILE: Final[str] = "agent.env"
 BASE_STATE: Final[str] = "base_state.json"
+# Where a conversation's archive keeps the files attached to it, by their path under the agent's inputs.
+INPUTS: Final[str] = ".openhands-a2a-inputs"
 FETCH_TIMEOUT_SECONDS: Final[int] = 120
 MAX_ATTACHMENT_BYTES: Final[int] = 256 * 1024 * 1024
 # A conversation id is derived from its context id, so a context finds its conversation across restarts.
@@ -136,6 +138,8 @@ class Turn:
     config: OpenHandsConfig
     endpoint: Endpoint
     on_event: Callable[[dict[str, Any]], None]
+    # What a run that was cancelled had spent by then.
+    on_usage: Callable[[Usage], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,49 +225,56 @@ async def _materialize(part: FilePart, index: int, directory: Path) -> Path:
     return destination
 
 
-def _pack(directory: Path, archive: Path) -> None:
+def _pack(directory: Path, archive: Path, attachments: Mapping[str, Path] | None = None) -> None:
+    """``directory``'s contents, and each of ``attachments`` under ``INPUTS`` by its name."""
     with tarfile.open(archive, "w:gz") as tar:
         for child in sorted(directory.iterdir()):
             tar.add(child, arcname=child.name)
+        for name, path in (attachments or {}).items():
+            tar.add(path, arcname=f"{INPUTS}/{name}")
 
 
-def _unpack(archive: Path, directory: Path) -> None:
-    """Replace ``directory``'s contents with the archive's. The archive is extracted into a staging directory
-    inside it first, so one that fails to extract leaves the contents as they were."""
+def _extract(archive: Path, directory: Path) -> Path:
+    """The archive extracted into a new staging directory inside ``directory``."""
     staging = directory / f".openhands-a2a-restore-{uuid.uuid4().hex}"
+    # An empty workspace's archive has no members, and extracting it creates nothing.
+    staging.mkdir()
     try:
-        # An empty workspace's archive has no members, and extracting it creates nothing.
-        staging.mkdir()
         with tarfile.open(archive) as tar:
             tar.extractall(staging, filter="data")
-        for child in directory.iterdir():
-            if child == staging:
-                continue
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        for child in staging.iterdir():
-            child.rename(directory / child.name)
-    finally:
+    except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging
 
 
-def _install_conversation(archive: Path, conversations_dir: Path, target_id: str) -> None:
-    """Make the archived conversation the one ``target_id`` names: the SDK resumes a conversation only under the id
-    and directory its state records."""
-    target = conversations_dir / target_id
-    staging = conversations_dir / f".{target_id}.{uuid.uuid4().hex}"
+def _replace_contents(directory: Path, staging: Path) -> None:
+    """Replace ``directory``'s contents with those of ``staging``, a directory inside it."""
+    for child in directory.iterdir():
+        if child == staging:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    for child in staging.iterdir():
+        child.rename(directory / child.name)
+    staging.rmdir()
+
+
+def _stage_conversation(archive: Path, conversations_dir: Path, target_id: str) -> Path:
+    """The archived conversation extracted beside the others, its state rewritten to name ``target_id``: the SDK
+    resumes a conversation only under the id and directory its state records. Raises ValueError for an archive that
+    holds no conversation."""
+    staging = _extract(archive, conversations_dir)
     try:
-        with tarfile.open(archive) as tar:
-            tar.extractall(staging, filter="data")
         state = json.loads((staging / BASE_STATE).read_text())
-        state.update(id=str(uuid.UUID(target_id)), persistence_dir=str(target))
-        (staging / BASE_STATE).write_text(json.dumps(state))
-        shutil.rmtree(target, ignore_errors=True)
-        staging.rename(target)
-    finally:
+        state.update(id=str(uuid.UUID(target_id)), persistence_dir=str(conversations_dir / target_id))
+    except (OSError, ValueError, AttributeError) as exc:
         shutil.rmtree(staging, ignore_errors=True)
+        raise ValueError(f"the trajectory object holds no OpenHands conversation: {type(exc).__name__}: {exc}") from exc
+    (staging / BASE_STATE).write_text(json.dumps(state))
+    return staging
 
 
 @a2a_agent(
@@ -317,12 +328,17 @@ class OpenHandsAgent(AgentEnvAgent):
         self.conversations_dir: Path = self.home / "conversations"
         self.skills_dir: Path = self.home / "skills"
         self.inputs_dir: Path = self.home / "inputs"
+        # Each conversation's attached files, by their path under inputs_dir, which its snapshots carry.
+        self.attachments_dir: Path = self.home / "attachments"
         # The framework already runs a context's tasks one at a time; this lets a snapshot save wait for the task
         # running in its context. An entry lives only while it is held, so contexts never seen again leave nothing.
         self._conversation_locks: dict[str, _ConversationLock] = {}
-        # Restoring the workspace waits for no task to be running in it; tasks and saves wait for a restore to finish.
+        # A task starts once no restore or workspace save holds this. A restore is refused while tasks run, and a
+        # workspace save waits for the tasks running in other contexts to end.
         self._workspace_lock: asyncio.Lock = asyncio.Lock()
         self._running: int = 0
+        self._idle: asyncio.Event = asyncio.Event()
+        self._idle.set()
 
     def create_app(self) -> Starlette:
         app = super().create_app()
@@ -339,11 +355,6 @@ class OpenHandsAgent(AgentEnvAgent):
             return TaskResult.failure("openhands.no_endpoint", "LITELLM_BASE_URL is not set", error_type="infra_error")
         workspace = request.workspace or self.workspace
         workspace.mkdir(parents=True, exist_ok=True)
-        try:
-            text, images = await self._prompt(request)
-        except (ValueError, OSError, httpx.HTTPError) as exc:
-            return TaskResult.failure("openhands.attachment", f"could not read a file part: {exc}")
-
         request.trajectory.set_format(TRAJECTORY_FORMAT)
         # The SDK calls back from its own threads too; the log takes one appender at a time.
         appending = threading.Lock()
@@ -354,44 +365,47 @@ class OpenHandsAgent(AgentEnvAgent):
                 request.trajectory.append(event)
 
         conversation = conversation_id(request.context_id)
-        turn = Turn(
-            conversation_id=conversation,
-            conversations_dir=self.conversations_dir,
-            workspace=workspace,
-            text=text,
-            images=images,
-            mcp_servers=_with_role(request.mcp_servers, config.role),
-            skills_dir=self.skills_dir,
-            skill_names=tuple(str(skill["name"]) for skill in request.skills),
-            config=config,
-            endpoint=self.endpoint,
-            on_event=on_event,
-        )
         # Bound before the run starts, so a live trajectory read or a mid-turn snapshot finds the conversation.
         self.set_session_ref_for_context(request.context_id, conversation)
-        async with self._workspace_lock:
-            self._running += 1
-        try:
-            async with self._holding(conversation):
-                try:
-                    async with asyncio.timeout(config.timeout_seconds):
-                        outcome = await self.runtime.run(turn)
-                except TimeoutError:
-                    message = f"OpenHands did not finish within {config.timeout_seconds}s"
-                    return (TaskResult.builder().failed("openhands.timeout", message).add_text(message)
-                            .session_ref(conversation).build())
-        finally:
-            self._running -= 1
+        spent: list[Usage] = []
+        async with self._holding(conversation), self._in_workspace():
+            try:
+                # Reading the file parts is part of the task, and so counts toward its time.
+                async with asyncio.timeout(config.timeout_seconds):
+                    try:
+                        text, images = await self._prompt(request, conversation)
+                    except (ValueError, OSError, httpx.HTTPError, httpx.InvalidURL) as exc:
+                        return TaskResult.failure("openhands.attachment", f"could not read a file part: {exc}")
+                    outcome = await self.runtime.run(Turn(
+                        conversation_id=conversation,
+                        conversations_dir=self.conversations_dir,
+                        workspace=workspace,
+                        text=text,
+                        images=images,
+                        mcp_servers=_with_role(request.mcp_servers, config.role),
+                        skills_dir=self.skills_dir,
+                        skill_names=tuple(str(skill["name"]) for skill in request.skills),
+                        config=config,
+                        endpoint=self.endpoint,
+                        on_event=on_event,
+                        on_usage=spent.append,
+                    ))
+            except TimeoutError:
+                message = f"OpenHands did not finish within {config.timeout_seconds}s"
+                timed_out = TaskResult.builder().failed("openhands.timeout", message).add_text(message)
+                return (timed_out.usage(spent[-1]) if spent else timed_out).session_ref(conversation).build()
         builder = TaskResult.builder().session_ref(conversation).usage(outcome.usage)
         if outcome.error_code is None:
             return builder.succeeded().add_text(outcome.text).build()
         return builder.failed(outcome.error_code, outcome.text, error_type=outcome.error_type).add_text(outcome.text).build()
 
-    async def _prompt(self, request: TaskRequest[OpenHandsConfig]) -> tuple[str, tuple[str, ...]]:
-        """The message text and its images as data URIs. Files are kept on disk for the conversation's later turns."""
+    async def _prompt(self, request: TaskRequest[OpenHandsConfig], conversation: str) -> tuple[str, tuple[str, ...]]:
+        """The message text and its images as data URIs. Files are kept on disk for the conversation's later turns,
+        and listed as its own, for its snapshots."""
         files_dir = self.inputs_dir / request.task_id
         chunks: list[str] = []
         images: list[str] = []
+        attached: list[str] = []
         for index, part in enumerate(request.parts):
             if isinstance(part, TextPart):
                 chunks.append(part.text)
@@ -400,11 +414,22 @@ class OpenHandsAgent(AgentEnvAgent):
             elif isinstance(part, FilePart):
                 files_dir.mkdir(parents=True, exist_ok=True)
                 path = await _materialize(part, index, files_dir)
+                attached.append(path.relative_to(self.inputs_dir).as_posix())
                 media_type = _media_type(part)
                 if media_type in _IMAGE_TYPES:
                     images.append(f"data:{media_type};base64,{base64.b64encode(path.read_bytes()).decode()}")
                 chunks.append(f"[Attached file ({media_type}) saved at {path}]")
+        if attached:
+            self._set_attachments(conversation, [*self._attachments(conversation), *attached])
         return "\n\n".join(chunks), tuple(images)
+
+    def _attachments(self, conversation: str) -> list[str]:
+        listed = self.attachments_dir / f"{conversation}.json"
+        return json.loads(listed.read_text()) if listed.is_file() else []
+
+    def _set_attachments(self, conversation: str, names: list[str]) -> None:
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
+        (self.attachments_dir / f"{conversation}.json").write_text(json.dumps(names))
 
     @asynccontextmanager
     async def _holding(self, conversation: str) -> AsyncIterator[None]:
@@ -417,6 +442,18 @@ class OpenHandsAgent(AgentEnvAgent):
             entry.holders -= 1
             if not entry.holders:
                 del self._conversation_locks[conversation]
+
+    @asynccontextmanager
+    async def _in_workspace(self) -> AsyncIterator[None]:
+        async with self._workspace_lock:
+            self._running += 1
+            self._idle.clear()
+        try:
+            yield
+        finally:
+            self._running -= 1
+            if not self._running:
+                self._idle.set()
 
     def _require_idle(self) -> None:
         if self._running:
@@ -433,8 +470,13 @@ class OpenHandsAgent(AgentEnvAgent):
             async with self._holding(conversation), self._workspace_lock:
                 if not (directory / BASE_STATE).is_file():
                     raise HTTPException(status_code=404, detail=f"No conversation for context '{request.context_id}'")
-                await asyncio.to_thread(_pack, directory, conversation_archive)
+                attachments = {name: self.inputs_dir / name for name in self._attachments(conversation)
+                               if (self.inputs_dir / name).is_file()}
+                await asyncio.to_thread(_pack, directory, conversation_archive, attachments)
                 if request.objects.workspace is not None:
+                    # Tasks in other contexts work in the same workspace: those running end first, and new ones wait
+                    # for the lock this holds.
+                    await self._idle.wait()
                     self.workspace.mkdir(parents=True, exist_ok=True)
                     await asyncio.to_thread(_pack, self.workspace, workspace_archive)
             objects = {"trajectory": (await upload(request.objects.trajectory, conversation_archive)).model_dump(mode="json")}
@@ -453,14 +495,46 @@ class OpenHandsAgent(AgentEnvAgent):
                 await download(request.objects.workspace, workspace_archive)
             async with self._workspace_lock:
                 self._require_idle()
-                if request.objects.workspace is not None:
-                    self.workspace.mkdir(parents=True, exist_ok=True)
-                    await asyncio.to_thread(_unpack, workspace_archive, self.workspace)
-                self.conversations_dir.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(
-                    _install_conversation, conversation_archive, self.conversations_dir, conversation_id(context_id)
-                )
+                workspace = workspace_archive if request.objects.workspace is not None else None
+                try:
+                    await asyncio.to_thread(self._restore, conversation_archive, workspace, conversation_id(context_id))
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"context_id": context_id}
+
+    def _restore(self, conversation_archive: Path, workspace_archive: Path | None, target: str) -> None:
+        """Extract both archives and check the conversation's, then put each in place: one that fails to extract, or
+        holds no conversation, changes nothing."""
+        self.conversations_dir.mkdir(parents=True, exist_ok=True)
+        conversation = _stage_conversation(conversation_archive, self.conversations_dir, target)
+        try:
+            if workspace_archive is not None:
+                self.workspace.mkdir(parents=True, exist_ok=True)
+                workspace = _extract(workspace_archive, self.workspace)
+                try:
+                    _replace_contents(self.workspace, workspace)
+                finally:
+                    shutil.rmtree(workspace, ignore_errors=True)
+            self._restore_attachments(conversation / INPUTS, target)
+            shutil.rmtree(self.conversations_dir / target, ignore_errors=True)
+            conversation.rename(self.conversations_dir / target)
+        finally:
+            shutil.rmtree(conversation, ignore_errors=True)
+
+    def _restore_attachments(self, staged: Path, target: str) -> None:
+        """Put the restored conversation's attached files back at the paths its messages name, and list them as the
+        target conversation's."""
+        names: list[str] = []
+        if staged.is_dir():
+            for path in sorted(path for path in staged.rglob("*") if path.is_file()):
+                name = path.relative_to(staged).as_posix()
+                destination = self.inputs_dir / name
+                if not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(path, destination)
+                names.append(name)
+            shutil.rmtree(staged)
+        self._set_attachments(target, names)
 
     @extension(SKILL_CONFIG_V1.add.inline)
     async def add_inline_skill(self, request: InlineSkillRequest) -> dict[str, Any]:

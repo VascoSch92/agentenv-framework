@@ -3,9 +3,8 @@ default tools, the task's MCP servers and its skills."""
 
 import asyncio
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
 from agentenv_protocol.a2a_agent import Usage
 from openhands.sdk import LLM, Agent, AgentContext, Conversation, ImageContent, Message, TextContent
@@ -19,26 +18,40 @@ from openhands.sdk.event.error_classification import FailureKind
 from openhands.sdk.llm.utils.metrics import Metrics
 from openhands.sdk.mcp import MCPServer
 from openhands.sdk.skills.skill import load_skills_from_dir
-from openhands.tools.preset.default import get_default_tools
+from openhands.tools.preset.default import get_default_condenser, get_default_tools
+from pydantic import PrivateAttr
 
+from conversation_run import ConversationRun
 from openhands_agent import Outcome, Turn
 
 # The AgentEnv endpoint is a LiteLLM gateway; this provider prefix sends LiteLLM's requests to it as is.
 _PROVIDER: Final[str] = "litellm_proxy"
 
 
+class _GatewayLLM(LLM):
+    """The SDK's LLM with the gateway's headers sent on every call but kept out of the conversation's persisted state,
+    which a snapshot uploads: the SDK saves the agent's LLM there and masks only its key fields."""
+
+    _gateway_headers: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    def _get_litellm_auth_values(self) -> tuple[str | None, dict[str, str]]:
+        api_key, headers = super()._get_litellm_auth_values()
+        return api_key, {**self._gateway_headers, **headers}
+
+
 def _llm(turn: Turn) -> LLM:
     options: dict[str, Any] = {}
     if turn.config.effort is not None:
         options["reasoning_effort"] = turn.config.effort
-    return LLM(
+    llm = _GatewayLLM(
         usage_id="agent",
         model=f"{_PROVIDER}/{turn.config.model}",
         base_url=turn.endpoint.base_url,
         api_key=turn.endpoint.api_key,
-        extra_headers=dict(turn.endpoint.extra_headers) or None,
         **options,
     )
+    llm._gateway_headers = dict(turn.endpoint.extra_headers)
+    return llm
 
 
 def _agent(turn: Turn) -> Agent:
@@ -47,16 +60,22 @@ def _agent(turn: Turn) -> Agent:
         loaded = load_skills_from_dir(turn.skills_dir, strict=False)
         skills = [skill for group in loaded for skill in group.values() if skill.name in turn.skill_names]
     mcp_config = {
+        # Literal, so a ${VAR} in a URL or header is sent as written, not filled from the agent's environment.
         name: MCPServer(url=registration["url"], transport="http", headers=registration.get("headers") or None)
+        .as_literal()
         for name, registration in turn.mcp_servers.items()
     }
     options: dict[str, Any] = {}
     if turn.config.system_prompt:
         options["system_prompt"] = turn.config.system_prompt
+    llm = _llm(turn)
     return Agent(
-        llm=_llm(turn),
+        llm=llm,
         tools=get_default_tools(enable_browser=False),
         mcp_config=mcp_config,
+        # The SDK's default agent condenses a conversation that outgrows its window; without one, a context's
+        # conversation, which every task adds to, fails every turn once it does.
+        condenser=get_default_condenser(llm=llm.model_copy(update={"usage_id": "condenser"})),
         agent_context=AgentContext(
             skills=skills,
             system_message_suffix=turn.config.append_system_prompt,
@@ -89,6 +108,11 @@ def _usage(before: Metrics, after: Metrics, tool_calls: int) -> Usage:
     )
 
 
+def _unstarted(exc: Exception) -> Outcome:
+    return Outcome(f"OpenHands could not start the turn: {type(exc).__name__}: {exc}", Usage(), "openhands.start",
+                   "infra_error")
+
+
 def _failure(
     error: ConversationErrorEvent | None,
     fallback: str,
@@ -103,53 +127,13 @@ def _failure(
     return Outcome(f"OpenHands failed: {error.detail}", usage, f"openhands.{error.code}", error_type)
 
 
-# The conversations running a turn, by id, with the loop each runs on.
-_Running: TypeAlias = dict[int, tuple[asyncio.AbstractEventLoop, BaseConversation]]
-
-
-def _interrupt(loop: asyncio.AbstractEventLoop, conversation: BaseConversation) -> None:
-    """Interrupt the run and close its tool executors: the terminal tool does not heed the interrupt, and a command
-    it is running would otherwise hold the run's thread until the command ends."""
-    # A run that ends meanwhile closes its loop, and then has nothing left to interrupt.
-    with suppress(RuntimeError):
-        loop.call_soon_threadsafe(conversation.interrupt)
-    conversation.close()
-
-
-async def _run_to_its_end(conversation: BaseConversation, running: _Running) -> None:
-    """``arun()`` on an event loop of its own in a worker thread, listed in ``running`` while it runs, interrupted when
-    the caller is cancelled and awaited until it has stopped. The SDK does blocking work between its awaits (tools,
-    persistence), which on the server's loop would stall every other task and the agent's own HTTP endpoints, the
-    peer-agents MCP server among them."""
-    runner = asyncio.Runner()
-    loop = runner.get_loop()
-
-    def drive() -> None:
-        # Closing the runner cancels what the run left on its loop, LiteLLM's logging worker among them.
-        with runner:
-            running[id(conversation)] = (loop, conversation)
-            try:
-                runner.run(conversation.arun())
-            finally:
-                running.pop(id(conversation), None)
-
-    thread = asyncio.ensure_future(asyncio.to_thread(drive))
-    try:
-        await asyncio.shield(thread)
-    except asyncio.CancelledError:
-        if not thread.done():
-            await asyncio.to_thread(_interrupt, loop, conversation)
-            await asyncio.wait([thread])
-        raise
-
-
 @dataclass(frozen=True, slots=True)
 class SdkRuntime:
-    _running: _Running = field(default_factory=dict, init=False, repr=False)
+    _runs: set[ConversationRun] = field(default_factory=set, init=False, repr=False)
 
     def stop(self) -> None:
-        for loop, conversation in list(self._running.values()):
-            _interrupt(loop, conversation)
+        for run in list(self._runs):
+            run.stop()
 
     async def run(self, turn: Turn) -> Outcome:
         actions = 0
@@ -176,19 +160,35 @@ class SdkRuntime:
                 delete_on_close=False,
             )
 
-        conversation = await asyncio.to_thread(open_conversation)
+        try:
+            conversation = await asyncio.to_thread(open_conversation)
+        except Exception as exc:  # a persisted conversation the SDK can't resume, for one
+            return _unstarted(exc)
+        # Listed before it starts, so the server's shutdown stops it however far it has got.
+        run = ConversationRun(conversation)
+        self._runs.add(run)
         try:
             before = conversation.conversation_stats.get_combined_metrics().model_copy(deep=True)
             content = [TextContent(text=turn.text), *(ImageContent(image_urls=[image]) for image in turn.images)]
-            await asyncio.to_thread(conversation.send_message, Message(role="user", content=content))
             try:
-                await _run_to_its_end(conversation, self._running)
+                await asyncio.to_thread(conversation.send_message, Message(role="user", content=content))
+            except Exception as exc:  # the agent's tools or MCP servers failing to start, for one
+                return _unstarted(exc)
+            try:
+                await run.to_its_end()
             except ConversationRunError as exc:
                 usage = _usage(before, conversation.conversation_stats.get_combined_metrics(), actions)
                 error = exc.conversation_error or (errors[-1] if errors else None)
                 return _failure(error, str(exc.original_exception), usage, "infra_error")
+            except asyncio.CancelledError:
+                turn.on_usage(_usage(before, conversation.conversation_stats.get_combined_metrics(), actions))
+                raise
             usage = _usage(before, conversation.conversation_stats.get_combined_metrics(), actions)
             status = conversation.state.execution_status
+            # Only the server's shutdown stops a run whose caller wasn't cancelled.
+            if run.stopped.is_set() and status != ConversationExecutionStatus.FINISHED:
+                return Outcome("OpenHands was stopped: the agent is shutting down", usage, "openhands.shutdown",
+                               "infra_error")
             if status == ConversationExecutionStatus.ERROR:
                 # A run limit, such as the iteration cap, ends the run without raising: the agent's own failure.
                 return _failure(errors[-1] if errors else None, "the run ended in error", usage, "agent_error")
@@ -197,4 +197,5 @@ class SdkRuntime:
             reply = get_agent_final_response(conversation.state.events)
             return Outcome(reply or "The agent finished without a reply.", usage)
         finally:
+            self._runs.discard(run)
             await asyncio.to_thread(conversation.close)
