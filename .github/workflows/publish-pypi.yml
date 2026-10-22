@@ -11,13 +11,14 @@ name: Publish to PyPI
 # It also publishes the images agent-env ships (agent_env.env.published_images), its infra images and its agents',
 # whose tags the registry lacks, and records their digests in the wheel and the release notes, once the repository
 # variable PUBLISH_INFRA_IMAGES is "true". The infra images are published before agentenv-framework-protocol. The
-# agents' images install the protocol the release ships with, so each release builds them anew once the protocol is on
-# PyPI. agentenv-framework waits for every image. Every job that reads the shipped bundles' folders first pins the
-# protocol in them as the wheel does (.github/scripts/shipped_bundles.py pin), so an image's tag, its build and the
-# wheel all see the same sources. Run by hand on main, the workflow publishes the images alone, with nothing sent to
-# PyPI; the agents' images then install the protocol version main is at, which must be on PyPI. Only the jobs that read
-# run agent-env and its dependencies; the jobs holding a token that pushes images or publishes to PyPI install nothing
-# and check what they're handed (.github/scripts/infra_build.py).
+# agents' images keep a protocol floor, so each is built only when its folder changes, once the protocol is on PyPI,
+# as a raised floor may name the protocol this release ships. agentenv-framework waits for every image. Every job that
+# reads the shipped bundles' folders first pins the protocol in their envs and artifacts as the wheel does
+# (.github/scripts/shipped_bundles.py pin), so an image's tag, its build and the wheel all see the same sources. Run
+# by hand on main, the workflow publishes the images alone, with nothing sent to PyPI; an agent's image then installs
+# the newest protocol on PyPI at or above its floor. Only the jobs that read run agent-env and its dependencies; the
+# jobs holding a token that pushes images or publishes to PyPI install nothing and check what they're handed
+# (.github/scripts/infra_build.py).
 
 on:
   push:
@@ -233,8 +234,8 @@ jobs:
         run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
 
   # The agents' images, built, checked and pushed as infra-build does the infra images, once the
-  # agentenv-framework-protocol they install is on PyPI: every release builds them anew, since the protocol pin in their
-  # requirements.txt is a source.
+  # agentenv-framework-protocol they install is on PyPI: an agent's floor may name the one this release ships. An image
+  # whose folder hasn't changed keeps its tag, which is published already, so no job here runs for it.
   agent-build:
     needs: [main-ci, infra-plan, protocol]
     # On a release, once the protocol is on PyPI; run by hand, once main's CI has passed, as no protocol is published.

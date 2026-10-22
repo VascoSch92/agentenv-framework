@@ -1,5 +1,5 @@
 """The agent's folder is its build context: the Dockerfile copies only its own files, keeps TLS checks on, and
-installs the protocol the release pins."""
+installs the protocol at or above its floor, which a release doesn't pin."""
 
 from __future__ import annotations
 

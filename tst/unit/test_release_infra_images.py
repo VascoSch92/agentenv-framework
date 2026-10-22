@@ -100,7 +100,7 @@ def test_a_failed_infra_image_job_sends_neither_package_to_pypi():
 
 
 def test_the_agents_images_are_built_once_the_protocol_they_install_is_on_pypi():
-    """Each installs the version the release pins in its requirements.txt; run by hand, no protocol is published."""
+    """An agent's protocol floor may name the version this release publishes; run by hand, none is published."""
     assert "protocol" in JOBS["agent-build"]["needs"]
     assert ("(needs.protocol.result == 'success' || (github.event_name == 'workflow_dispatch' "
             "&& needs.protocol.result == 'skipped'))") in _condition("agent-build")
@@ -117,7 +117,7 @@ def test_the_framework_waits_for_every_image_job():
 
 
 def test_every_job_that_reads_the_shipped_bundles_pins_the_protocol_first():
-    """The pin is a source of the agents' images: a job without it would tag, build, record or ship other sources."""
+    """The pin is a source of the shipped envs: a job without it would tag, build, record or ship other sources."""
     readers = {job: "\n".join(_runs(job)) for job in JOBS if _READS_SHIPPED_SOURCES.search("\n".join(_runs(job)))}
 
     assert set(readers) == {"infra-plan", "infra-build", "agent-build", "infra-record", "framework"}
@@ -125,14 +125,17 @@ def test_every_job_that_reads_the_shipped_bundles_pins_the_protocol_first():
         assert runs.count(_PIN) == 1 and runs.index(_PIN) < _READS_SHIPPED_SOURCES.search(runs).start(), job
 
 
-def test_the_images_built_after_the_protocol_are_those_the_pin_changes():
-    """An infra image is built before the protocol is on PyPI, so none of them can install the version a release pins."""
+def test_the_pin_changes_no_published_images_sources():
+    """A published image is built again only when its folder changes: a protocol pin in it would build a new one every
+    release, and an infra image, built before the protocol is on PyPI, couldn't install the version pinned."""
     shipped_bundles = load_script("shipped_bundles.py")
     pinned = [path for path in shipped_bundles.requirements_files()
               if any(line.startswith(shipped_bundles.PROTOCOL) for line in path.read_text().splitlines())]
 
-    assert {image.name for image in bootstrap.PUBLISHED_IMAGES
-            if any(path.is_relative_to(image.dockerfile.parent) for path in pinned)} == {i.name for i in AGENT_IMAGES}
+    assert pinned
+    assert not [(image.name, path) for image in bootstrap.PUBLISHED_IMAGES for path in pinned
+                if path.is_relative_to(image.dockerfile.parent)]
+    assert AGENT_IMAGES and all(image in bootstrap.PUBLISHED_IMAGES for image in AGENT_IMAGES)
 
 
 def test_the_github_release_is_created_whenever_the_framework_is_published():
