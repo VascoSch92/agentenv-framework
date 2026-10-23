@@ -42,7 +42,7 @@ http-server = [
 
 [[package]]
 name = "agentenv-framework"
-version = "0.9.1350"
+version = "0.9.1351"
 source = { editable = "." }
 dependencies = [
     { name = "a2a-sdk" },
@@ -185,7 +185,7 @@ provides-extras = ["aws", "explorer", "gcp", "sail", "vercel", "tensorlake", "te
 
 [[package]]
 name = "agentenv-framework-protocol"
-version = "0.1.365"
+version = "0.1.366"
 source = { editable = "packages/agentenv-protocol" }
 dependencies = [
     { name = "httpx" },
