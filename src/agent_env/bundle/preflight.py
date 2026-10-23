@@ -77,7 +77,7 @@ from agent_env.task_step.task_steps.verifiers.rubrics_verifier import RubricsVer
 from agent_env.utils.docker.build import DEFAULT_BUILD_PLATFORM, docker_plugin_missing, docker_unreachable
 
 from .parse import BundleError, BundleKind
-from .plan import Plan
+from .plan import AgentOverride, Plan
 from .resolve import BuiltImage, Reference, ReferencedImage, ResolvedEntry, build_step
 
 _SHOWN = 3
@@ -147,18 +147,20 @@ class _Walk:
     def task(self, task: ResolvedEntry) -> None:
         steps = [build_step(config) for config in task.config]
         sandboxes = {step.sandbox_name: step for step in steps if isinstance(step, DeploySandboxTaskStep)}
+        solver = self.plan.agent.steps.get(task.entry.id, ()) if self.plan.agent else ()
         for step in steps:
             where = f"{self.plan.path(task.entry)}: step {step.id!r}"
+            override = self.plan.agent if step.id in solver else None
             try:
                 if isinstance(step, DeployEnvTaskStep):
                     self._env(where, step)
                 elif isinstance(step, DeployAgentTaskStep):
-                    self._agent(where, step, sandboxes)
+                    self._agent(where, step, sandboxes, override)
                 elif isinstance(step, DeploySandboxTaskStep):
                     self._sandbox(where, step)
                 elif isinstance(step, RubricsVerifierTaskStep):
                     self._judge(where, step)
-                elif isinstance(step, InstallAgentTaskStep) and step.a2a_agent_id is None:
+                elif isinstance(step, InstallAgentTaskStep) and step.a2a_agent_id is None and override is None:
                     self.default_agent_users.append((where, "names no agent"))
             except ValueError as e:  # a provider that names no backend, or can't be built from its config
                 self._problem(where, str(e))
@@ -301,7 +303,9 @@ class _Walk:
         """The version a write names a store entity at: its pin, else the one the plan read, which the writer pins."""
         return version if version is not None else self.plan.store_latest.get((kind, entity_id))
 
-    def _agent(self, where: str, step: DeployAgentTaskStep, sandboxes: dict[str, DeploySandboxTaskStep]) -> None:
+    def _agent(self, where: str, step: DeployAgentTaskStep, sandboxes: dict[str, DeploySandboxTaskStep],
+               override: AgentOverride | None = None) -> None:
+        """Check a deploy of the step's agent, or of ``override``, the agent ``--agent`` names for the solver."""
         accepts: Callable[[SandboxProvider], Accepts] = A2AAgent.accepts
         if step.sandbox_name:
             linked = sandboxes.get(step.sandbox_name)
@@ -315,8 +319,9 @@ class _Walk:
         else:
             provider = _provider(self.sandbox or step.sandbox_type, get_agent_sandbox_provider)
         given = frozenset({*step.env_vars, *([ENV_BASE_URL] if step.litellm_base_url else [])})
-        self._agent_deploy(where, provider, step.a2a_agent_id, step.a2a_agent_version, "names no agent", accepts,
-                           given=given)
+        agent_id, version = ((override.agent_id, override.version) if override is not None
+                             else (step.a2a_agent_id, step.a2a_agent_version))
+        self._agent_deploy(where, provider, agent_id, version, "names no agent", accepts, given=given)
 
     def _judge(self, where: str, step: RubricsVerifierTaskStep) -> None:
         if not step.use_agent_judge or step.agent_name is not None:
